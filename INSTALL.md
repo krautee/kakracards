@@ -3,7 +3,7 @@
 ## 1) Prepare environment file
 
 ```bash
-cd /home/runner/work/kakracards/kakracards
+cd /path/to/kakracards
 cp .env-sample .env
 ```
 
