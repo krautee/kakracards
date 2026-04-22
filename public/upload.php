@@ -41,11 +41,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['card_image']) && !is
     if (!is_uploaded_file($_FILES['card_image']['tmp_name'] ?? '')) {
         $error = 'Please choose an image file.';
     } else {
-        $targetName = date('Ymd_His') . '_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', (string) $_FILES['card_image']['name']);
+        $originalName = (string) ($_FILES['card_image']['name'] ?? '');
+        $extension = strtolower((string) pathinfo($originalName, PATHINFO_EXTENSION));
+        $allowedExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+        if (!in_array($extension, $allowedExtensions, true)) {
+            $error = 'Unsupported file type. Allowed: jpg, jpeg, png, gif, webp.';
+        }
+
+        $targetName = date('Ymd_His') . '_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', $originalName);
         $imagePath = rtrim(uploadDir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $targetName;
-        if (!move_uploaded_file($_FILES['card_image']['tmp_name'], $imagePath)) {
+        if ($error === '' && !move_uploaded_file($_FILES['card_image']['tmp_name'], $imagePath)) {
             $error = 'Failed to store uploaded image.';
-        } else {
+        } elseif ($error === '') {
             try {
                 $decoded = decodeImageWithPython($imagePath);
             } catch (Throwable $e) {

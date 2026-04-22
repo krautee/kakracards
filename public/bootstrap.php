@@ -91,6 +91,16 @@ function pythonBin(): string
     return envValue('PYTHON_BIN', 'python3');
 }
 
+function safePythonBin(): string
+{
+    $bin = pythonBin();
+    if (!preg_match('/^[a-zA-Z0-9_\\-\\.\\/]+$/', $bin)) {
+        throw new RuntimeException('Invalid PYTHON_BIN value');
+    }
+
+    return $bin;
+}
+
 function decodeImageWithPython(string $imagePath): array
 {
     $tmpPrompt = tempnam(sys_get_temp_dir(), 'kakra_prompt_');
@@ -99,7 +109,7 @@ function decodeImageWithPython(string $imagePath): array
     $script = ROOT_DIR . '/python/decode_cards.py';
     $cmd = sprintf(
         '%s %s --image %s --prompt-file %s --no-db --json 2>&1',
-        escapeshellcmd(pythonBin()),
+        escapeshellarg(safePythonBin()),
         escapeshellarg($script),
         escapeshellarg($imagePath),
         escapeshellarg($tmpPrompt)

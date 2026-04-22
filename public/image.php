@@ -19,12 +19,19 @@ if (!$row) {
 }
 
 $path = (string) $row['source_image_path'];
-if (!str_starts_with($path, uploadDir() . DIRECTORY_SEPARATOR) || !is_file($path)) {
+$realUploadDir = realpath(uploadDir());
+$realPath = realpath($path);
+if (
+    $realUploadDir === false ||
+    $realPath === false ||
+    !is_file($realPath) ||
+    !str_starts_with($realPath, rtrim($realUploadDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR)
+) {
     http_response_code(404);
     exit('Image not found');
 }
 
-$mime = mime_content_type($path) ?: 'application/octet-stream';
+$mime = mime_content_type($realPath) ?: 'application/octet-stream';
 header('Content-Type: ' . $mime);
-header('Content-Length: ' . (string) filesize($path));
-readfile($path);
+header('Content-Length: ' . (string) filesize($realPath));
+readfile($realPath);
