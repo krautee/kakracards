@@ -71,9 +71,9 @@ function savePromptText(string $text): void
 {
     $stmt = pdo()->prepare(
         'INSERT INTO app_settings (`key`, `value`) VALUES (:key, :value)
-         ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), updated_at = CURRENT_TIMESTAMP'
+         ON DUPLICATE KEY UPDATE `value` = :value_update, updated_at = CURRENT_TIMESTAMP'
     );
-    $stmt->execute(['key' => 'prompt_text', 'value' => $text]);
+    $stmt->execute(['key' => 'prompt_text', 'value' => $text, 'value_update' => $text]);
 }
 
 function uploadDir(): string
