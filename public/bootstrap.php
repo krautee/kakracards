@@ -32,6 +32,18 @@ function envValue(string $name, ?string $default = null): ?string
 
 loadEnvFile(ROOT_DIR . '/.env');
 
+function resolveProjectPath(string $path): string
+{
+    if ($path === '') {
+        return ROOT_DIR;
+    }
+    if ($path[0] === '/' || preg_match('/^[A-Za-z]:[\\\\\\/]/', $path) === 1) {
+        return $path;
+    }
+
+    return ROOT_DIR . '/' . ltrim($path, './');
+}
+
 function pdo(): PDO
 {
     static $pdo = null;
@@ -63,7 +75,7 @@ function getPromptText(): string
         return (string) $row['value'];
     }
 
-    $path = envValue('PROMPT_FILE', ROOT_DIR . '/prompts/default_prompt.md');
+    $path = resolveProjectPath((string) envValue('PROMPT_FILE', './prompts/default_prompt.md'));
     return is_file($path) ? (string) file_get_contents($path) : '';
 }
 
@@ -78,7 +90,7 @@ function savePromptText(string $text): void
 
 function uploadDir(): string
 {
-    $dir = envValue('UPLOAD_DIR', ROOT_DIR . '/uploads');
+    $dir = resolveProjectPath((string) envValue('UPLOAD_DIR', './uploads'));
     if (!is_dir($dir)) {
         mkdir($dir, 0775, true);
     }
@@ -94,7 +106,7 @@ function pythonBin(): string
 function safePythonBin(): string
 {
     $bin = pythonBin();
-    if (!preg_match('/^[a-zA-Z0-9_\\-\\.]+$/', $bin)) {
+    if (!preg_match('/^[a-zA-Z0-9_\\-]+$/', $bin)) {
         throw new RuntimeException('Invalid PYTHON_BIN value');
     }
 

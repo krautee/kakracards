@@ -48,7 +48,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['card_image']) && !is
             $error = 'Unsupported file type. Allowed: jpg, jpeg, png, gif, webp.';
         }
 
-        $targetName = date('Ymd_His') . '_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', $originalName);
+        $baseName = (string) pathinfo($originalName, PATHINFO_FILENAME);
+        $safeBaseName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $baseName);
+        $targetName = date('Ymd_His') . '_' . $safeBaseName . '.' . $extension;
         $imagePath = rtrim(uploadDir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $targetName;
         if ($error === '' && !move_uploaded_file($_FILES['card_image']['tmp_name'], $imagePath)) {
             $error = 'Failed to store uploaded image.';
