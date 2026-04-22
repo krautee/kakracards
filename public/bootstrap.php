@@ -109,13 +109,32 @@ function safePythonBin(): string
     if (!preg_match('/^[a-zA-Z0-9_\\-]+$/', $bin)) {
         throw new RuntimeException('Invalid PYTHON_BIN value');
     }
+    $process = proc_open(
+        ['which', $bin],
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes,
+        null,
+        null,
+        ['bypass_shell' => true]
+    );
+    if (!is_resource($process)) {
+        throw new RuntimeException('Unable to validate PYTHON_BIN');
+    }
+    $stdout = trim(stream_get_contents($pipes[1]) ?: '');
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $status = proc_close($process);
+    if ($status !== 0 || $stdout === '' || !is_executable($stdout)) {
+        throw new RuntimeException('PYTHON_BIN is not executable');
+    }
 
-    return $bin;
+    return $stdout;
 }
 
 function decodeImageWithPython(string $imagePath): array
 {
     $tmpPrompt = tempnam(sys_get_temp_dir(), 'kakra_prompt_');
+    chmod($tmpPrompt, 0600);
     file_put_contents($tmpPrompt, getPromptText());
 
     $script = ROOT_DIR . '/python/decode_cards.py';

@@ -206,7 +206,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        sys.exit(main())
     except requests.HTTPError as exc:
         body = exc.response.text if exc.response is not None else str(exc)
         print(f"Gemini API error: {body}", file=sys.stderr)
