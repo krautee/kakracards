@@ -94,7 +94,7 @@ function pythonBin(): string
 function safePythonBin(): string
 {
     $bin = pythonBin();
-    if (!preg_match('/^[a-zA-Z0-9_\\-\\.\\/]+$/', $bin)) {
+    if (!preg_match('/^[a-zA-Z0-9_\\-\\.]+$/', $bin)) {
         throw new RuntimeException('Invalid PYTHON_BIN value');
     }
 
@@ -107,22 +107,42 @@ function decodeImageWithPython(string $imagePath): array
     file_put_contents($tmpPrompt, getPromptText());
 
     $script = ROOT_DIR . '/python/decode_cards.py';
-    $cmd = sprintf(
-        '%s %s --image %s --prompt-file %s --no-db --json 2>&1',
-        escapeshellarg(safePythonBin()),
-        escapeshellarg($script),
-        escapeshellarg($imagePath),
-        escapeshellarg($tmpPrompt)
+    $cmd = [
+        safePythonBin(),
+        $script,
+        '--image',
+        $imagePath,
+        '--prompt-file',
+        $tmpPrompt,
+        '--no-db',
+        '--json',
+    ];
+    $process = proc_open(
+        $cmd,
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes,
+        null,
+        null,
+        ['bypass_shell' => true]
     );
 
-    exec($cmd, $output, $exitCode);
+    if (!is_resource($process)) {
+        @unlink($tmpPrompt);
+        throw new RuntimeException('Failed to execute decoder process');
+    }
+
+    $stdout = stream_get_contents($pipes[1]) ?: '';
+    $stderr = stream_get_contents($pipes[2]) ?: '';
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
     @unlink($tmpPrompt);
 
     if ($exitCode !== 0) {
-        throw new RuntimeException("Decode failed: " . implode("\n", $output));
+        throw new RuntimeException("Decode failed: " . trim($stderr !== '' ? $stderr : $stdout));
     }
 
-    $json = json_decode(implode("\n", $output), true);
+    $json = json_decode($stdout, true);
     if (!is_array($json) || !isset($json[0]['decoded']) || !is_array($json[0]['decoded'])) {
         throw new RuntimeException('Unexpected decode output');
     }
