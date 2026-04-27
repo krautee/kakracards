@@ -19,6 +19,10 @@ if (!in_array($selectedPromptFile, $promptFiles, true)) {
 $preferredModels = preferredGeminiModels();
 $selectedModels = normalizedModelSelection($_POST['gemini_models'] ?? []);
 
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && (int) ($_GET['saved'] ?? 0) === 1) {
+  $message = 'Record saved.';
+}
+
 function asJson(mixed $value, int $statusCode = 200): never
 {
     http_response_code($statusCode);
@@ -114,6 +118,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_record'])) {
         $error = 'Missing source image path while saving.';
     } else {
         $id = insertDecodedRecord($decoded, $imagePath);
+      saveDecodeFieldQuality($id, $reviewJobIds, $decoded);
       foreach ($reviewJobIds as $rid) {
         $key = (string) $rid;
         $lines = [];
@@ -123,7 +128,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_record'])) {
         setDecodeJobUncertainties((int) $rid, $lines);
       }
         markDecodeJobsSaved($reviewJobIds, $id);
-        header('Location: edit.php?id=' . $id . '&saved=1');
+        if (countPendingDecodeJobs() > 0) {
+          header('Location: upload.php?saved=1&focus=jobs');
+        } else {
+          header('Location: edit.php?id=' . $id . '&saved=1');
+        }
         exit;
     }
 }
@@ -273,8 +282,9 @@ function usageMetadataFields(array $usageMetadata): array
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <style>
     :root{color-scheme:light}
-    body{font-family:Arial,sans-serif;max-width:1420px;margin:18px auto;padding:0 16px;background:#f6f4ef;color:#1f2933}
+    body{font-family:Arial,sans-serif;max-width:1700px;margin:18px auto;padding:0 16px;background:#f6f4ef;color:#1f2933}
     a{color:#184d8d}
+    .nav a{display:inline-block;padding:6px 10px;background:#1155cc;color:#fff;text-decoration:none;border-radius:4px;margin-right:8px}
     h1{margin:8px 0 16px}
     input[type=text],input[type=date],textarea,select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #c7ced6;border-radius:10px;background:#fff;font:inherit}
     textarea{min-height:120px;resize:vertical}
@@ -301,7 +311,7 @@ function usageMetadataFields(array $usageMetadata): array
     .model-name{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78rem;font-weight:700;border:1px solid transparent;white-space:nowrap}
     .tiny-btn{padding:6px 10px;border:1px solid #c6d1df;border-radius:8px;background:#fff;cursor:pointer;text-decoration:none;color:#1f2933;display:inline-block}
     .tiny-btn:hover{background:#f8fafc}
-    .panel-grid{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(300px,0.8fr);gap:20px;align-items:start}
+    .panel-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(420px,1.15fr);gap:20px;align-items:start}
     .jobs-grid{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(300px,0.8fr);gap:20px;align-items:start}
     .header-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
     .header-field{display:flex;flex-direction:column;gap:4px}
@@ -310,7 +320,7 @@ function usageMetadataFields(array $usageMetadata): array
     .preview{position:sticky;top:16px;display:flex;flex-direction:column;gap:12px}
     .preview-frame{padding:14px;border:1px solid #d7dce2;border-radius:20px;background:linear-gradient(180deg,#ffffff,#f3f0e8);box-shadow:0 12px 30px rgba(15,23,42,.08)}
     .preview-frame img{display:block;width:100%;height:auto;border-radius:14px;background:#fff}
-    .preview-viewport{max-height:calc(100vh - 72px);overflow:auto;border-radius:14px;background:#fff;cursor:zoom-in;overscroll-behavior:contain}
+    .preview-viewport{max-height:calc(100vh - 72px);min-height:540px;overflow:auto;border-radius:14px;background:#fff;cursor:zoom-in;overscroll-behavior:contain}
     .preview-viewport img{display:block;width:100%;height:auto;max-width:none;transform-origin:top left;user-select:none;-webkit-user-drag:none}
     .preview-help{margin:8px 2px 0;color:#6b7280;font-size:.85rem}
     .meta{padding:14px 16px;border:1px solid #d7dce2;border-radius:16px;background:#fff}
@@ -324,7 +334,12 @@ function usageMetadataFields(array $usageMetadata): array
   </style>
 </head>
 <body>
-<p><a href="index.php">&larr; Back</a></p>
+<p class="nav">
+  <a href="index.php">Home</a>
+  <a href="upload.php">Upload &amp; Decode</a>
+  <a href="settings.php">Settings (Prompt)</a>
+  <a href="stats.php">Statistics</a>
+</p>
 <h1>Upload & Decode</h1>
 <?php if ($message !== ''): ?><p style="color:#065f46;"><strong><?= h($message) ?></strong></p><?php endif; ?>
 <?php if ($error !== ''): ?><p style="color:#a00;"><strong><?= h($error) ?></strong></p><?php endif; ?>
@@ -360,7 +375,7 @@ function usageMetadataFields(array $usageMetadata): array
   </form>
 </div>
 
-<div class="section">
+<div class="section" id="jobs-top">
   <fieldset>
     <legend>Decode Jobs</legend>
     <table class="jobs-table">
@@ -386,6 +401,7 @@ function usageMetadataFields(array $usageMetadata): array
 <div id="hover-modal"><img src="" alt="Decode job image preview"></div>
 
 <?php if ($comparisonDataJson !== 'null'): ?>
+  <div id="review-focus-anchor" style="position:relative;top:-8px;"></div>
   <p>Review and correct values, then save. Black values are resolved. Double click red values to select them. Double click black values to edit.</p>
   <form id="review-form" method="post">
     <input type="hidden" name="review_job_ids" id="review_job_ids" value="">
@@ -409,7 +425,7 @@ function usageMetadataFields(array $usageMetadata): array
             <div class="preview-viewport" id="preview-viewport">
               <img id="preview-image" src="<?= h($previewDataUri) ?>" alt="Uploaded card image">
             </div>
-            <p class="preview-help">Scroll over the image to zoom. Drag scrollbars to move around.</p>
+            <p class="preview-help">Scroll to zoom. When zoomed in, click-drag to pan around the image.</p>
           </div>
         <?php else: ?>
           <div class="empty-preview">Preview will appear here after upload.</div>
@@ -426,8 +442,32 @@ function usageMetadataFields(array $usageMetadata): array
   const waitSeconds = document.getElementById('wait-seconds');
   const hoverModal = document.getElementById('hover-modal');
   const hoverModalImg = hoverModal ? hoverModal.querySelector('img') : null;
+  const params = new URLSearchParams(window.location.search);
   let submitStart = 0;
   let submitTimer = null;
+
+  function scrollToAnchor(anchorId) {
+    const anchor = document.getElementById(anchorId);
+    if (!anchor) return;
+    const top = Math.max(0, Math.floor(anchor.getBoundingClientRect().top + window.pageYOffset - 8));
+    window.scrollTo({ top: top, behavior: 'auto' });
+  }
+
+  if (params.get('focus') === 'jobs') {
+    scrollToAnchor('jobs-top');
+  }
+
+  if (params.has('review_job_id')) {
+    if ('scrollRestoration' in history) {
+      history.scrollRestoration = 'manual';
+    }
+    scrollToAnchor('review-focus-anchor');
+    window.addEventListener('load', function () {
+      setTimeout(function () {
+        scrollToAnchor('review-focus-anchor');
+      }, 0);
+    });
+  }
 
   if (queueForm && waitIndicator && waitSeconds) {
     queueForm.addEventListener('submit', function () {
@@ -451,6 +491,11 @@ function usageMetadataFields(array $usageMetadata): array
       let previewScale = 1;
       const minScale = 1;
       const maxScale = 6;
+      let isPanning = false;
+      let panStartX = 0;
+      let panStartY = 0;
+      let startScrollLeft = 0;
+      let startScrollTop = 0;
 
       function setPreviewZoom(nextScale, originX, originY) {
         const oldScale = previewScale;
@@ -471,6 +516,33 @@ function usageMetadataFields(array $usageMetadata): array
         const zoomFactor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
         setPreviewZoom(previewScale * zoomFactor, e.clientX - rect.left, e.clientY - rect.top);
       }, { passive: false });
+
+      previewImage.addEventListener('dragstart', function (e) {
+        e.preventDefault();
+      });
+
+      previewViewport.addEventListener('mousedown', function (e) {
+        if (previewScale <= 1) return;
+        isPanning = true;
+        panStartX = e.clientX;
+        panStartY = e.clientY;
+        startScrollLeft = previewViewport.scrollLeft;
+        startScrollTop = previewViewport.scrollTop;
+        previewViewport.style.cursor = 'grabbing';
+        e.preventDefault();
+      });
+
+      window.addEventListener('mousemove', function (e) {
+        if (!isPanning) return;
+        previewViewport.scrollLeft = startScrollLeft - (e.clientX - panStartX);
+        previewViewport.scrollTop = startScrollTop - (e.clientY - panStartY);
+      });
+
+      window.addEventListener('mouseup', function () {
+        if (!isPanning) return;
+        isPanning = false;
+        previewViewport.style.cursor = previewScale > 1 ? 'move' : 'zoom-in';
+      });
     }
 
     function syncTableToJSON(tableSelector, jsonSelector, columns) {
@@ -538,7 +610,7 @@ function usageMetadataFields(array $usageMetadata): array
       });
     }
 
-    const contentColumns = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes', 'decoding_status'];
+    const contentColumns = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes'];
     const recoveryColumns = ['ring_number', 'recovery_status', 'recovery_date', 'recovery_location', 'recovery_person', 'recovery_notes'];
 
     handleAddRow('.btn-add-content-row', '.content-rows', contentColumns);
@@ -573,6 +645,10 @@ function usageMetadataFields(array $usageMetadata): array
     return String(text || '').replace(/[&<>"']/g, function (ch) {
       return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];
     });
+  }
+
+  function isPreciseEditorDate(value) {
+    return /^\d{2}\.\d{2}\.\d{4}$/.test(String(value || '').trim());
   }
 
   const modelPalette = ['#0f766e', '#1d4ed8', '#b45309', '#7c3aed', '#b91c1c', '#0e7490', '#be185d', '#4d7c0f'];
@@ -894,7 +970,7 @@ function usageMetadataFields(array $usageMetadata): array
     }
   }
 
-  function attachFieldEvents(container, stateObj, onChange) {
+  function attachFieldEvents(container, stateObj, onChange, fieldKey) {
     const resolved = container.querySelector('.resolved-val');
     if (resolved) {
       resolved.addEventListener('dblclick', () => {
@@ -906,6 +982,20 @@ function usageMetadataFields(array $usageMetadata): array
         if (isMultiLine) input.style.minHeight = '60px';
         container.innerHTML = '';
         container.appendChild(input);
+        const canOpenCalendar = !isMultiLine
+          && (fieldKey === 'recovery_date' || fieldKey === 'ringing_date');
+
+        if (canOpenCalendar && window.flatpickr) {
+          const picker = window.flatpickr(input, {
+            dateFormat: 'd.m.Y',
+            allowInput: true,
+            clickOpens: true,
+            defaultDate: String(stateObj.value || '').trim()
+          });
+          if (picker && typeof picker.open === 'function') {
+            picker.open();
+          }
+        }
         input.focus();
         input.addEventListener('blur', () => {
           stateObj.value = input.value;
@@ -1042,58 +1132,118 @@ function usageMetadataFields(array $usageMetadata): array
     html += `</div></fieldset></div>`;
 
     // Content
-    const cCols = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes', 'decoding_status'];
-    const cHead = ['Position', 'Number', 'Status', 'Year', 'Nest', 'Notes', 'Decoding'];
+    const cCols = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes'];
+    const cHead = ['Position', 'Number', 'Status', 'Year', 'Nest', 'Notes', 'Ins', 'Del'];
     html += `<div class="section"><fieldset><legend>Content rows</legend>`;
     html += `<table style="width:100%;border-collapse:collapse;margin-top:8px;">`;
     html += `<thead><tr style="background:#f6f9fc;">`;
     cHead.forEach(h => html += `<th style="border:1px solid #d7dce2;padding:8px;text-align:left;font-weight:700;font-size:0.85rem;">${h}</th>`);
     html += `</tr></thead><tbody>`;
     if (contentState.length === 0) {
-      html += `<tr><td colspan="7" style="border:1px solid #d7dce2;padding:16px;text-align:center;color:#999;font-style:italic;">No content rows</td></tr>`;
+      html += `<tr><td colspan="8" style="border:1px solid #d7dce2;padding:16px;text-align:center;color:#999;font-style:italic;">No content rows</td></tr>`;
     } else {
       contentState.forEach((row, i) => {
         html += `<tr style="${i % 2 ? 'background:#f9fafb;' : ''}">`;
         cCols.forEach(col => {
           html += `<td style="border:1px solid #d7dce2;padding:6px;vertical-align:top;"><div id="ui-c-${i}-${col}">${renderField(row[col])}</div></td>`;
         });
+        html += `<td style="border:1px solid #d7dce2;padding:6px;text-align:center;vertical-align:top;"><button type="button" class="tiny-btn btn-insert-content-row" data-row="${i}" title="Insert row below">+</button></td>`;
+        html += `<td style="border:1px solid #d7dce2;padding:6px;text-align:center;vertical-align:top;"><button type="button" class="tiny-btn btn-del-content-row" data-row="${i}" title="Delete content row">x</button></td>`;
         html += `</tr>`;
       });
     }
-    html += `</tbody></table></fieldset></div>`;
+    html += `</tbody></table><div style="margin-top:8px;"><button type="button" class="tiny-btn btn-add-content-row">+ Add content row</button></div></fieldset></div>`;
 
     // Recovery
     const rCols = ['ring_number', 'recovery_status', 'recovery_date', 'recovery_location', 'recovery_person', 'recovery_notes'];
-    const rHead = ['Number', 'Status', 'Date', 'Location', 'Person', 'Notes', 'Del'];
+    const rHead = ['Number', 'Status', 'Date', 'Location', 'Person', 'Notes', 'Ins', 'Del'];
     html += `<div class="section"><fieldset><legend>Recovery rows</legend>`;
     html += `<table style="width:100%;border-collapse:collapse;margin-top:8px;">`;
     html += `<thead><tr style="background:#f6f9fc;">`;
     rHead.forEach(h => html += `<th style="border:1px solid #d7dce2;padding:8px;text-align:left;font-weight:700;font-size:0.85rem;">${h}</th>`);
     html += `</tr></thead><tbody>`;
     if (recoveryState.length === 0) {
-      html += `<tr><td colspan="7" style="border:1px solid #d7dce2;padding:16px;text-align:center;color:#999;font-style:italic;">No recovery rows</td></tr>`;
+      html += `<tr><td colspan="8" style="border:1px solid #d7dce2;padding:16px;text-align:center;color:#999;font-style:italic;">No recovery rows</td></tr>`;
     } else {
       recoveryState.forEach((row, i) => {
         html += `<tr style="${i % 2 ? 'background:#f9fafb;' : ''}">`;
         rCols.forEach(col => {
           html += `<td style="border:1px solid #d7dce2;padding:6px;vertical-align:top;"><div id="ui-r-${i}-${col}">${renderField(row[col])}</div></td>`;
         });
+        html += `<td style="border:1px solid #d7dce2;padding:6px;text-align:center;vertical-align:top;"><button type="button" class="tiny-btn btn-insert-recovery-row" data-row="${i}" title="Insert row below">+</button></td>`;
         html += `<td style="border:1px solid #d7dce2;padding:6px;text-align:center;vertical-align:top;"><button type="button" class="tiny-btn btn-del-recovery-row" data-row="${i}" title="Delete recovery row">x</button></td>`;
         html += `</tr>`;
       });
     }
-    html += `</tbody></table></fieldset></div>`;
+    html += `</tbody></table><div style="margin-top:8px;"><button type="button" class="tiny-btn btn-add-recovery-row">+ Add recovery row</button></div></fieldset></div>`;
 
     editor.innerHTML = html;
 
-    for (const k in hLabels) attachFieldEvents(document.getElementById(`ui-h-${k}`), headerState[k], () => renderAndCheck());
+    for (const k in hLabels) attachFieldEvents(document.getElementById(`ui-h-${k}`), headerState[k], () => renderAndCheck(), k);
     
     contentState.forEach((row, i) => {
-      cCols.forEach(col => attachFieldEvents(document.getElementById(`ui-c-${i}-${col}`), row[col], () => renderAndCheck()));
+      cCols.forEach(col => attachFieldEvents(document.getElementById(`ui-c-${i}-${col}`), row[col], () => renderAndCheck(), col));
     });
     
     recoveryState.forEach((row, i) => {
-      rCols.forEach(col => attachFieldEvents(document.getElementById(`ui-r-${i}-${col}`), row[col], () => renderAndCheck()));
+      rCols.forEach(col => attachFieldEvents(document.getElementById(`ui-r-${i}-${col}`), row[col], () => renderAndCheck(), col));
+    });
+
+    editor.querySelectorAll('.btn-add-content-row').forEach(btn => {
+      btn.addEventListener('click', function () {
+        const next = {};
+        cCols.forEach(col => {
+          next[col] = { value: '', isResolved: true };
+        });
+        contentState.push(next);
+        renderAndCheck();
+      });
+    });
+
+    editor.querySelectorAll('.btn-insert-content-row').forEach(btn => {
+      btn.addEventListener('click', function () {
+        const idx = Number(btn.getAttribute('data-row') || -1);
+        if (idx < 0 || idx >= contentState.length) return;
+        const next = {};
+        cCols.forEach(col => {
+          next[col] = { value: '', isResolved: true };
+        });
+        contentState.splice(idx + 1, 0, next);
+        renderAndCheck();
+      });
+    });
+
+    editor.querySelectorAll('.btn-del-content-row').forEach(btn => {
+      btn.addEventListener('click', function () {
+        const idx = Number(btn.getAttribute('data-row') || -1);
+        if (idx < 0 || idx >= contentState.length) return;
+        contentState.splice(idx, 1);
+        renderAndCheck();
+      });
+    });
+
+    editor.querySelectorAll('.btn-add-recovery-row').forEach(btn => {
+      btn.addEventListener('click', function () {
+        const next = {};
+        rCols.forEach(col => {
+          next[col] = { value: '', isResolved: true };
+        });
+        recoveryState.push(next);
+        renderAndCheck();
+      });
+    });
+
+    editor.querySelectorAll('.btn-insert-recovery-row').forEach(btn => {
+      btn.addEventListener('click', function () {
+        const idx = Number(btn.getAttribute('data-row') || -1);
+        if (idx < 0 || idx >= recoveryState.length) return;
+        const next = {};
+        rCols.forEach(col => {
+          next[col] = { value: '', isResolved: true };
+        });
+        recoveryState.splice(idx + 1, 0, next);
+        renderAndCheck();
+      });
     });
 
     editor.querySelectorAll('.btn-del-recovery-row').forEach(btn => {

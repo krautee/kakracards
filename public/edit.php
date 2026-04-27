@@ -35,6 +35,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     try {
         updateDecodedRecord($id, $decoded);
+      refreshDecodeFieldQualityForHeader($id, $decoded);
         $message = 'Saved.';
     } catch (Throwable $e) {
         $error = $e->getMessage();
@@ -50,7 +51,7 @@ if (!$header) {
     exit;
 }
 
-$contentStmt = pdo()->prepare('SELECT ring_position, ring_number, obs_status, obs_year, obs_nest, obs_notes, decoding_status FROM cards_content WHERE header_id=:id ORDER BY row_no');
+$contentStmt = pdo()->prepare('SELECT ring_position, ring_number, obs_status, obs_year, obs_nest, obs_notes FROM cards_content WHERE header_id=:id ORDER BY row_no');
 $contentStmt->execute(['id' => $id]);
 $contentRows = $contentStmt->fetchAll();
 
@@ -58,6 +59,8 @@ $recoveryStmt = pdo()->prepare('SELECT ring_number, recovery_status, recovery_da
 $recoveryStmt->execute(['id' => $id]);
 $recoveryRows = $recoveryStmt->fetchAll();
 $uncertaintiesText = (string) ($header['uncertainties'] ?? '');
+$ringingDateValue = formatDateForEditor((string) ($header['ringing_date'] ?? ''));
+$ringingDateHasFullDate = preg_match('/^\d{2}\.\d{2}\.\d{4}$/', $ringingDateValue) === 1;
 ?>
 <!doctype html>
 <html lang="en">
@@ -67,8 +70,9 @@ $uncertaintiesText = (string) ($header['uncertainties'] ?? '');
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <style>
     :root{color-scheme:light}
-    body{font-family:Arial,sans-serif;max-width:1380px;margin:18px auto;padding:0 16px;background:#f6f4ef;color:#1f2933}
+    body{font-family:Arial,sans-serif;max-width:1700px;margin:18px auto;padding:0 16px;background:#f6f4ef;color:#1f2933}
     a{color:#184d8d}
+    .nav a{display:inline-block;padding:6px 10px;background:#1155cc;color:#fff;text-decoration:none;border-radius:4px;margin-right:8px}
     h1{margin:8px 0 16px}
     input[type=text],input[type=date],textarea,select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #c7ced6;border-radius:10px;background:#fff;font:inherit}
     textarea{min-height:120px;resize:vertical}
@@ -83,6 +87,9 @@ $uncertaintiesText = (string) ($header['uncertainties'] ?? '');
     .preview{position:sticky;top:16px;display:flex;flex-direction:column;gap:12px}
     .preview-frame{padding:14px;border:1px solid #d7dce2;border-radius:20px;background:linear-gradient(180deg,#ffffff,#f3f0e8);box-shadow:0 12px 30px rgba(15,23,42,.08)}
     .preview-frame img{display:block;width:100%;height:auto;border-radius:14px;background:#fff}
+    .preview-viewport{max-height:calc(100vh - 72px);min-height:540px;overflow:auto;border-radius:14px;background:#fff;cursor:zoom-in;overscroll-behavior:contain}
+    .preview-viewport img{display:block;width:100%;height:auto;max-width:none;transform-origin:top left;user-select:none;-webkit-user-drag:none}
+    .preview-help{margin:8px 2px 0;color:#6b7280;font-size:.85rem}
     .empty-preview{display:grid;place-items:center;min-height:300px;border:1px dashed #c7ced6;border-radius:14px;color:#6b7280;background:#f9fafb;text-align:center;padding:20px}
     .actions{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
     .actions button{padding:10px 16px;border:0;border-radius:999px;background:#184d8d;color:#fff;font-weight:700;cursor:pointer}
@@ -93,7 +100,12 @@ $uncertaintiesText = (string) ($header['uncertainties'] ?? '');
   </style>
 </head>
 <body>
-<p><a href="index.php">&larr; Back</a></p>
+<p class="nav">
+  <a href="index.php">Home</a>
+  <a href="upload.php">Upload &amp; Decode</a>
+  <a href="settings.php">Settings (Prompt)</a>
+  <a href="stats.php">Statistics</a>
+</p>
 <h1>Edit Record #<?= $id ?></h1>
 <?php if ($message !== ''): ?><p style="color:#060;"><strong><?= h($message) ?></strong></p><?php endif; ?>
 <?php if ($error !== ''): ?><p style="color:#a00;"><strong><?= h($error) ?></strong></p><?php endif; ?>
@@ -150,7 +162,7 @@ $uncertaintiesText = (string) ($header['uncertainties'] ?? '');
             </div>
             <div class="header-field">
               <label for="ringing_date">ringingDate</label>
-              <input id="ringing_date" type="text" class="datepicker" name="ringing_date" value="<?= h($header['ringing_date']) ?>">
+              <input id="ringing_date" type="text" class="<?= $ringingDateHasFullDate ? 'datepicker' : '' ?>" name="ringing_date" value="<?= h($ringingDateValue) ?>">
             </div>
             <div class="header-field">
               <label for="ringing_nest">ringingNest</label>
@@ -190,7 +202,10 @@ $uncertaintiesText = (string) ($header['uncertainties'] ?? '');
     <aside class="preview">
       <?php if ($previewDataUri !== ''): ?>
         <div class="preview-frame">
-          <img src="<?= h($previewDataUri) ?>" alt="Uploaded card image">
+          <div class="preview-viewport" id="preview-viewport">
+            <img id="preview-image" src="<?= h($previewDataUri) ?>" alt="Uploaded card image">
+          </div>
+          <p class="preview-help">Scroll to zoom. When zoomed in, click-drag to pan around the image.</p>
         </div>
       <?php else: ?>
         <div class="empty-preview">Image preview not available</div>
@@ -203,6 +218,66 @@ $uncertaintiesText = (string) ($header['uncertainties'] ?? '');
 document.addEventListener('DOMContentLoaded', function() {
   const form = document.querySelector('form');
   if (!form) return;
+
+  const previewViewport = document.getElementById('preview-viewport');
+  const previewImage = document.getElementById('preview-image');
+  if (previewViewport && previewImage) {
+    let previewScale = 1;
+    const minScale = 1;
+    const maxScale = 6;
+    let isPanning = false;
+    let panStartX = 0;
+    let panStartY = 0;
+    let startScrollLeft = 0;
+    let startScrollTop = 0;
+
+    function setPreviewZoom(nextScale, originX, originY) {
+      const oldScale = previewScale;
+      previewScale = Math.min(maxScale, Math.max(minScale, nextScale));
+      if (previewScale === oldScale) return;
+
+      const scrollLeftRatio = (previewViewport.scrollLeft + originX) / oldScale;
+      const scrollTopRatio = (previewViewport.scrollTop + originY) / oldScale;
+      previewImage.style.width = (previewScale * 100) + '%';
+      previewViewport.scrollLeft = scrollLeftRatio * previewScale - originX;
+      previewViewport.scrollTop = scrollTopRatio * previewScale - originY;
+      previewViewport.style.cursor = previewScale > 1 ? 'move' : 'zoom-in';
+    }
+
+    previewViewport.addEventListener('wheel', function(e) {
+      e.preventDefault();
+      const rect = previewViewport.getBoundingClientRect();
+      const zoomFactor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      setPreviewZoom(previewScale * zoomFactor, e.clientX - rect.left, e.clientY - rect.top);
+    }, { passive: false });
+
+    previewImage.addEventListener('dragstart', function(e) {
+      e.preventDefault();
+    });
+
+    previewViewport.addEventListener('mousedown', function(e) {
+      if (previewScale <= 1) return;
+      isPanning = true;
+      panStartX = e.clientX;
+      panStartY = e.clientY;
+      startScrollLeft = previewViewport.scrollLeft;
+      startScrollTop = previewViewport.scrollTop;
+      previewViewport.style.cursor = 'grabbing';
+      e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', function(e) {
+      if (!isPanning) return;
+      previewViewport.scrollLeft = startScrollLeft - (e.clientX - panStartX);
+      previewViewport.scrollTop = startScrollTop - (e.clientY - panStartY);
+    });
+
+    window.addEventListener('mouseup', function() {
+      if (!isPanning) return;
+      isPanning = false;
+      previewViewport.style.cursor = previewScale > 1 ? 'move' : 'zoom-in';
+    });
+  }
 
   function syncTableToJSON(tableSelector, jsonSelector, columns) {
     const table = document.querySelector(tableSelector + ' tbody');
@@ -261,6 +336,56 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   }
 
+  function handleInsertRows(tableSelector, jsonSelector, columns) {
+    const table = document.querySelector(tableSelector);
+    if (!table) return;
+    table.addEventListener('click', function(e) {
+      if (!e.target.classList.contains('btn-insert-row')) return;
+      e.preventDefault();
+      const currentRow = e.target.closest('tr');
+      if (!currentRow) return;
+
+      const newRow = document.createElement('tr');
+      newRow.style.backgroundColor = '#f9fafb';
+      columns.forEach(col => {
+        const td = document.createElement('td');
+        td.style.cssText = 'border:1px solid #d7dce2;padding:6px;';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'col-' + col + (col === 'recovery_date' ? ' datepicker' : '');
+        input.style.cssText = 'width:100%;padding:4px;border:1px solid #ddd;border-radius:4px;';
+        td.appendChild(input);
+        newRow.appendChild(td);
+      });
+
+      const insertTd = document.createElement('td');
+      insertTd.style.cssText = 'border:1px solid #d7dce2;padding:6px;text-align:center;';
+      const insertBtn = document.createElement('button');
+      insertBtn.type = 'button';
+      insertBtn.className = 'btn-insert-row';
+      insertBtn.textContent = '+';
+      insertBtn.style.cssText = 'padding:4px 8px;background:#ecfdf5;border:1px solid #86efac;cursor:pointer;font-size:0.8rem;';
+      insertTd.appendChild(insertBtn);
+      newRow.appendChild(insertTd);
+
+      const delTd = document.createElement('td');
+      delTd.style.cssText = 'border:1px solid #d7dce2;padding:6px;text-align:center;';
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'btn-del-row';
+      delBtn.textContent = '×';
+      delBtn.style.cssText = 'padding:4px 8px;background:#f5f5f5;border:1px solid #ddd;cursor:pointer;font-size:0.8rem;';
+      delTd.appendChild(delBtn);
+      newRow.appendChild(delTd);
+
+      currentRow.parentNode.insertBefore(newRow, currentRow.nextSibling);
+      if (window.flatpickr && tableSelector === '.recovery-rows') {
+        window.flatpickr(newRow.querySelectorAll('.datepicker'), { dateFormat: 'd.m.Y', allowInput: true });
+      }
+      syncTableToJSON(tableSelector, jsonSelector, columns);
+    });
+  }
+
   function handleDeleteRows(tableSelector, jsonSelector, columns) {
     const table = document.querySelector(tableSelector);
     if (!table) return;
@@ -273,13 +398,15 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   }
 
-  const contentColumns = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes', 'decoding_status'];
+  const contentColumns = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes'];
   const recoveryColumns = ['ring_number', 'recovery_status', 'recovery_date', 'recovery_location', 'recovery_person', 'recovery_notes'];
 
   handleAddRow('.btn-add-content-row', '.content-rows', contentColumns);
+  handleInsertRows('.content-rows', 'textarea[name="content_json"]', contentColumns);
   handleDeleteRows('.content-rows', 'textarea[name="content_json"]', contentColumns);
 
   handleAddRow('.btn-add-recovery-row', '.recovery-rows', recoveryColumns);
+  handleInsertRows('.recovery-rows', 'textarea[name="recovery_json"]', recoveryColumns);
   handleDeleteRows('.recovery-rows', 'textarea[name="recovery_json"]', recoveryColumns);
 
   form.addEventListener('submit', function() {

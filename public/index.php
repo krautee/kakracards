@@ -32,16 +32,16 @@ $rows = pdo()->query('SELECT id, bird_id, card_code, scull_length, ring_number, 
   <meta charset="utf-8">
   <title>KakraCards</title>
   <style>
-    body{font-family:Arial,sans-serif;max-width:1300px;margin:20px auto;padding:0 16px}
+    body{font-family:Arial,sans-serif;max-width:1700px;margin:18px auto;padding:0 16px;background:#f6f4ef;color:#1f2933}
     table{border-collapse:collapse;width:100%}
     th,td{border:1px solid #ddd;padding:8px;vertical-align:middle}
     th{background:#f4f4f4}
+    .nav a{display:inline-block;padding:6px 10px;background:#1155cc;color:#fff;text-decoration:none;border-radius:4px;margin-right:8px}
     .sort-header{cursor:pointer;user-select:none}
     .sort-header:hover{background:#e8eef8}
     .inline-cell{width:100%;box-sizing:border-box;padding:5px 7px;border:1px solid #cfd7e3;border-radius:6px}
     .inline-cell.saving{background:#fff3cd}
     .inline-cell.saved{background:#d1fae5}
-    a.button{display:inline-block;padding:6px 10px;background:#1155cc;color:#fff;text-decoration:none;border-radius:4px;margin-right:8px}
     .image-link{color:#1d4f91;text-decoration:underline;cursor:pointer}
     #hover-modal{position:fixed;display:none;z-index:9999;pointer-events:none;background:#fff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 14px 40px rgba(0,0,0,.2);padding:8px}
     #hover-modal img{display:block;max-width:760px;max-height:760px;border-radius:6px}
@@ -49,9 +49,11 @@ $rows = pdo()->query('SELECT id, bird_id, card_code, scull_length, ring_number, 
 </head>
 <body>
 <h1>KakraCards Decoder</h1>
-<p>
-  <a class="button" href="upload.php">Upload & Decode</a>
-  <a class="button" href="settings.php">Settings (Prompt)</a>
+<p class="nav">
+  <a href="index.php">Home</a>
+  <a href="upload.php">Upload &amp; Decode</a>
+  <a href="settings.php">Settings (Prompt)</a>
+  <a href="stats.php">Statistics</a>
 </p>
 <table id="cards-table">
   <thead>

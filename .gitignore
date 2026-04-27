@@ -4,3 +4,5 @@ __pycache__/
 python/__pycache__/
 uploads/*
 !uploads/.gitkeep
+logs/*.log
+!logs/.gitkeep

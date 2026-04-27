@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
 def load_job(cur, job_id: int):
     cur.execute(
         """
-        SELECT id, source_image_path, prompt_file_path, status
+        SELECT id, source_image_path, prompt_file_path, requested_model, status
         FROM decode_jobs
         WHERE id=%s
         LIMIT 1
@@ -66,9 +66,16 @@ def main() -> int:
 
         prompt_file = str(job.get("prompt_file_path") or "")
         prompt_text = decode_cards.read_prompt(prompt_file)
-        result = decode_cards.call_gemini(Path(str(job["source_image_path"])).resolve(), prompt_text)
+        requested_model = str(job.get("requested_model") or "").strip() or None
+        result = decode_cards.call_gemini(
+            Path(str(job["source_image_path"])).resolve(),
+            prompt_text,
+            requested_model,
+        )
         decoded = result["decoded"]
         usage_metadata = result["usageMetadata"]
+        model = str(result.get("model") or requested_model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")).strip()
+        total_token_count = int(usage_metadata.get("totalTokenCount") or 0)
 
         cur.execute(
             """
@@ -76,6 +83,8 @@ def main() -> int:
             SET status='succeeded',
                 decoded_json=%s,
                 usage_metadata_json=%s,
+                decoding_model=%s,
+                total_token_count=%s,
                 finished_at=NOW(),
                 updated_at=NOW()
             WHERE id=%s
@@ -83,10 +92,17 @@ def main() -> int:
             (
                 json.dumps(decoded, ensure_ascii=False),
                 json.dumps(usage_metadata, ensure_ascii=False),
+                model,
+                total_token_count,
                 args.job_id,
             ),
         )
         conn.commit()
+        if prompt_file:
+            try:
+                os.unlink(prompt_file)
+            except OSError:
+                pass
         return 0
 
     except Exception as exc:

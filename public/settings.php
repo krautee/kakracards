@@ -41,9 +41,9 @@ $preferredModels = preferredGeminiModels();
 ?>
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Settings</title><style>body{font-family:Arial,sans-serif;max-width:1100px;margin:20px auto;padding:0 16px}textarea{width:100%;min-height:420px}</style></head>
+<head><meta charset="utf-8"><title>Settings</title><style>body{font-family:Arial,sans-serif;max-width:1700px;margin:18px auto;padding:0 16px;background:#f6f4ef;color:#1f2933}.nav a{display:inline-block;padding:6px 10px;background:#1155cc;color:#fff;text-decoration:none;border-radius:4px;margin-right:8px}textarea{width:100%;min-height:420px}</style></head>
 <body>
-<p><a href="index.php">&larr; Back</a></p>
+<p class="nav"><a href="index.php">Home</a><a href="upload.php">Upload &amp; Decode</a><a href="settings.php">Settings (Prompt)</a><a href="stats.php">Statistics</a></p>
 <h1>Prompt and Model Settings</h1>
 <?php if ($message !== ''): ?><p><strong><?= h($message) ?></strong></p><?php endif; ?>
 <?php if ($error !== ''): ?><p style="color:#a00;"><strong><?= h($error) ?></strong></p><?php endif; ?>

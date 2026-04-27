@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS decode_field_quality (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    header_id BIGINT UNSIGNED NOT NULL,
+    decode_job_id BIGINT UNSIGNED NOT NULL,
+    model VARCHAR(128) NOT NULL,
+    prompt_file_path VARCHAR(1024) NULL,
+    section VARCHAR(16) NOT NULL,
+    row_no INT UNSIGNED NULL,
+    field_name VARCHAR(64) NOT NULL,
+    predicted_value TEXT NULL,
+    final_value TEXT NULL,
+    exact_match TINYINT(1) NOT NULL DEFAULT 0,
+    normalized_match TINYINT(1) NOT NULL DEFAULT 0,
+    error_type VARCHAR(32) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_dfq_model (model),
+    INDEX idx_dfq_header (header_id),
+    INDEX idx_dfq_job (decode_job_id),
+    INDEX idx_dfq_field (section, field_name)
+);
