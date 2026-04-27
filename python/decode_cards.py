@@ -5,17 +5,28 @@ import json
 import mimetypes
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-
-import mysql.connector
-import requests
-from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_env() -> None:
-    load_dotenv(ROOT / ".env")
+    env_path = ROOT / ".env"
+    if not env_path.is_file():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name and name not in os.environ:
+            os.environ[name] = value
 
 
 def read_prompt(prompt_file: str | None) -> str:
@@ -23,12 +34,13 @@ def read_prompt(prompt_file: str | None) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def call_gemini(image_path: Path, prompt_text: str) -> dict:
+def call_gemini(image_path: Path, prompt_text: str, model_override: str | None = None) -> dict:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is required")
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model = (model_override or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")).strip()
+    timeout_sec = int(os.getenv("GEMINI_TIMEOUT_SEC", "180"))
     mime_type = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
     image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
 
@@ -47,9 +59,21 @@ def call_gemini(image_path: Path, prompt_text: str) -> dict:
             "responseMimeType": "application/json",
         },
     }
-    response = requests.post(url, params={"key": api_key}, json=payload, timeout=180)
-    response.raise_for_status()
-    data = response.json()
+    request = urllib.request.Request(
+        f"{url}?{urllib.parse.urlencode({'key': api_key})}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini API error: {body}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"Gemini read timed out after {timeout_sec}s") from exc
 
     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])
     text = parts[0].get("text", "{}").strip()
@@ -58,10 +82,26 @@ def call_gemini(image_path: Path, prompt_text: str) -> dict:
     parsed = json.loads(text)
     if not isinstance(parsed, dict):
         raise RuntimeError("Gemini response is not a JSON object")
-    return parsed
+
+    usage_metadata = data.get("usageMetadata")
+    if not isinstance(usage_metadata, dict):
+        usage_metadata = {}
+
+    return {
+        "decoded": parsed,
+        "usageMetadata": usage_metadata,
+        "model": model,
+    }
 
 
 def db_connection():
+    try:
+        import mysql.connector
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "mysql-connector-python is required only when saving to MySQL; install python/requirements.txt or run with --no-db"
+        ) from exc
+
     return mysql.connector.connect(
         host=os.getenv("MYSQL_HOST", "127.0.0.1"),
         port=int(os.getenv("MYSQL_PORT", "3306")),
@@ -162,6 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Decode Kakra cards with Gemini API")
     parser.add_argument("--image", nargs="+", required=True, help="Path(s) to card image(s)")
     parser.add_argument("--prompt-file", help="Prompt markdown file path")
+    parser.add_argument("--model", help="Gemini model to use for this run")
     parser.add_argument("--no-db", action="store_true", help="Do not insert results to MySQL")
     parser.add_argument("--json", action="store_true", help="Print JSON output")
     return parser.parse_args()
@@ -178,10 +219,13 @@ def main() -> int:
         results = []
         for img in args.image:
             image_path = Path(img).resolve()
-            decoded = call_gemini(image_path, prompt_text)
+            result = call_gemini(image_path, prompt_text, args.model)
+            decoded = result["decoded"]
             entry = {
                 "image": str(image_path),
                 "decoded": decoded,
+                "usageMetadata": result["usageMetadata"],
+                "model": result["model"],
             }
             if conn is not None:
                 header_id = insert_decoding(conn, decoded, image_path)
@@ -207,10 +251,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except requests.HTTPError as exc:
-        body = exc.response.text if exc.response is not None else str(exc)
-        print(f"Gemini API error: {body}", file=sys.stderr)
-        raise SystemExit(2)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1)

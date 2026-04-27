@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS decode_jobs (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    source_image_filename VARCHAR(255) NOT NULL,
+    source_image_path VARCHAR(1024) NOT NULL,
+    prompt_file_path VARCHAR(1024) NOT NULL,
+    requested_model VARCHAR(128) NULL,
+    comparison_group VARCHAR(64) NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'queued',
+    error_message TEXT NULL,
+    usage_metadata_json JSON NULL,
+    decoding_model VARCHAR(128) NULL,
+    total_token_count INT UNSIGNED NULL,
+    decoded_json JSON NULL,
+    attempt_count INT UNSIGNED NOT NULL DEFAULT 1,
+    saved_header_id BIGINT UNSIGNED NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP NULL,
+    finished_at TIMESTAMP NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_decode_jobs_status_created (status, created_at),
+    INDEX idx_decode_jobs_saved (saved_header_id)
+);

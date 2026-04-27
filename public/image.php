@@ -5,14 +5,23 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 $id = (int) ($_GET['id'] ?? 0);
-if ($id <= 0) {
+$jobId = (int) ($_GET['job_id'] ?? 0);
+if ($id <= 0 && $jobId <= 0) {
     http_response_code(400);
-    exit('Missing id');
+    exit('Missing id or job_id');
 }
 
-$stmt = pdo()->prepare('SELECT source_image_path FROM cards_header WHERE id=:id');
-$stmt->execute(['id' => $id]);
-$row = $stmt->fetch();
+$row = false;
+if ($jobId > 0) {
+    $stmt = pdo()->prepare('SELECT source_image_path FROM decode_jobs WHERE id=:id');
+    $stmt->execute(['id' => $jobId]);
+    $row = $stmt->fetch();
+} else {
+    $stmt = pdo()->prepare('SELECT source_image_path FROM cards_header WHERE id=:id');
+    $stmt->execute(['id' => $id]);
+    $row = $stmt->fetch();
+}
+
 if (!$row) {
     http_response_code(404);
     exit('Not found');

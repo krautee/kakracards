@@ -1,0 +1,2 @@
+ALTER TABLE decode_jobs
+ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0;
