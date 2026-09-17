@@ -53,8 +53,10 @@ try {
     $result = decodeImageWithPythonPrompt($sourceImagePath, $promptFilePath, $requestedModel !== '' ? $requestedModel : null);
     $decoded = is_array($result['decoded'] ?? null) ? $result['decoded'] : [];
     $usage = is_array($result['usageMetadata'] ?? null) ? $result['usageMetadata'] : [];
-    $model = trim((string) ($result['model'] ?? $requestedModel ?: getenv('GEMINI_MODEL') ?: 'gemini-2.5-flash'));
+    $requested = trim((string) ($result['model'] ?? $requestedModel ?: getenv('GEMINI_MODEL') ?: 'gemini-2.5-flash'));
+    $model = trim((string) ($result['resolvedModel'] ?? '')) ?: $requested;
     $totalTokenCount = isset($usage['totalTokenCount']) ? (int) $usage['totalTokenCount'] : null;
+    $cost = $usage['costUsd'] ?? null;
 
     $doneStmt = pdo()->prepare(
         'UPDATE decode_jobs
@@ -63,6 +65,10 @@ try {
               usage_metadata_json=:usage_metadata_json,
               decoding_model=:decoding_model,
               total_token_count=:total_token_count,
+              prompt_token_count=:prompt_token_count,
+              completion_token_count=:completion_token_count,
+              reasoning_token_count=:reasoning_token_count,
+              cost_usd=:cost_usd,
               finished_at=NOW(),
              updated_at=CURRENT_TIMESTAMP
          WHERE id=:id'
@@ -74,8 +80,16 @@ try {
         'usage_metadata_json' => json_encode($usage, JSON_UNESCAPED_UNICODE),
         'decoding_model' => $model,
         'total_token_count' => $totalTokenCount,
+        'prompt_token_count' => (int) ($usage['promptTokenCount'] ?? 0),
+        'completion_token_count' => (int) ($usage['candidatesTokenCount'] ?? 0),
+        'reasoning_token_count' => (int) ($usage['thoughtsTokenCount'] ?? 0),
+        'cost_usd' => is_numeric($cost) ? (float) $cost : null,
     ]);
     @unlink($promptFilePath);
+
+    if ((int) ($job['benchmark_header_id'] ?? 0) > 0) {
+        scoreBenchmarkJob($jobId);
+    }
     exit(0);
 } catch (Throwable $e) {
     try {

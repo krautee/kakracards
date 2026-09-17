@@ -847,10 +847,29 @@ function formatDateForEditor(string $value): string
     return $trimmed;
 }
 
+/** True when every value in the row is blank (an untouched "+ Add row" template). */
+function isBlankRow(mixed $row, ?array $keys = null): bool
+{
+    if (!is_array($row)) {
+        return true;
+    }
+    foreach ($keys ?? array_keys($row) as $key) {
+        if (trim((string) ($row[$key] ?? '')) !== '') {
+            return false;
+        }
+    }
+    return true;
+}
+
 function normalizeRows(string $jsonText): array
 {
     $rows = json_decode($jsonText, true);
-    return is_array($rows) ? array_values(array_filter($rows, static fn($row) => is_array($row))) : [];
+    if (!is_array($rows)) {
+        return [];
+    }
+    // Drop rows the reviewer added but never filled; saving them pollutes the ground
+    // truth and every later benchmark would be penalised for not producing blank rows.
+    return array_values(array_filter($rows, static fn($row) => is_array($row) && !isBlankRow($row)));
 }
 
 function insertDecodedRecord(array $decoded, string $sourceImagePath): int
@@ -1023,16 +1042,38 @@ function updateDecodedRecord(int $id, array $decoded): void
     $pdo->commit();
 }
 
-function createPromptSnapshotFile(?string $promptRelativePath = null): string
+/**
+ * Register a prompt text in prompt_versions (keyed by sha256) so every job/quality row
+ * can point at the exact prompt that produced it. Returns the sha256.
+ */
+function registerPromptVersion(string $promptName, string $promptText): string
+{
+    $sha = hash('sha256', $promptText);
+    $stmt = pdo()->prepare(
+        'INSERT INTO prompt_versions (sha256, prompt_name, prompt_text) VALUES (:sha, :name, :text)
+         ON DUPLICATE KEY UPDATE prompt_name = prompt_name'
+    );
+    $stmt->execute(['sha' => $sha, 'name' => $promptName, 'text' => $promptText]);
+
+    return $sha;
+}
+
+function getPromptVersionText(string $sha256): ?string
+{
+    $stmt = pdo()->prepare('SELECT prompt_text FROM prompt_versions WHERE sha256 = :sha LIMIT 1');
+    $stmt->execute(['sha' => $sha256]);
+    $row = $stmt->fetch();
+
+    return $row ? (string) $row['prompt_text'] : null;
+}
+
+function writePromptSnapshotFile(string $promptText): string
 {
     $tmpPrompt = tempnam(sys_get_temp_dir(), 'kakra_prompt_job_');
     if ($tmpPrompt === false) {
         throw new RuntimeException('Unable to allocate prompt snapshot file');
     }
     chmod($tmpPrompt, 0644);
-    $promptText = $promptRelativePath === null
-        ? getPromptText()
-        : getPromptTextFromRelativePath($promptRelativePath);
     if (file_put_contents($tmpPrompt, $promptText) === false) {
         @unlink($tmpPrompt);
         throw new RuntimeException('Unable to write prompt snapshot file');
@@ -1041,21 +1082,48 @@ function createPromptSnapshotFile(?string $promptRelativePath = null): string
     return $tmpPrompt;
 }
 
-function createDecodeJob(string $sourceImagePath, ?string $promptRelativePath = null, ?string $requestedModel = null, ?string $comparisonGroup = null): int
+/**
+ * Snapshot the prompt for one job. Returns [tmp_path, prompt_name, sha256].
+ */
+function createPromptSnapshot(?string $promptRelativePath = null): array
 {
+    $promptName = $promptRelativePath ?? getCurrentPromptFileRelativePath();
+    $promptText = getPromptTextFromRelativePath($promptName);
+    $sha = registerPromptVersion($promptName, $promptText);
+
+    return [writePromptSnapshotFile($promptText), $promptName, $sha];
+}
+
+function createPromptSnapshotFile(?string $promptRelativePath = null): string
+{
+    return createPromptSnapshot($promptRelativePath)[0];
+}
+
+function createDecodeJob(
+    string $sourceImagePath,
+    ?string $promptRelativePath = null,
+    ?string $requestedModel = null,
+    ?string $comparisonGroup = null,
+    ?int $benchmarkHeaderId = null
+): int {
     ensureDecodeJobAnalysisColumns();
-    $promptSnapshot = createPromptSnapshotFile($promptRelativePath);
+    [$promptSnapshot, $promptName, $promptSha] = createPromptSnapshot($promptRelativePath);
     $stmt = pdo()->prepare(
         'INSERT INTO decode_jobs
-         (source_image_filename, source_image_path, prompt_file_path, requested_model, comparison_group, status, attempt_count)
-         VALUES (:source_image_filename, :source_image_path, :prompt_file_path, :requested_model, :comparison_group, :status, :attempt_count)'
+         (source_image_filename, source_image_path, prompt_file_path, prompt_name, prompt_sha256,
+          requested_model, comparison_group, benchmark_header_id, status, attempt_count)
+         VALUES (:source_image_filename, :source_image_path, :prompt_file_path, :prompt_name, :prompt_sha256,
+          :requested_model, :comparison_group, :benchmark_header_id, :status, :attempt_count)'
     );
     $stmt->execute([
         'source_image_filename' => basename($sourceImagePath),
         'source_image_path' => $sourceImagePath,
         'prompt_file_path' => $promptSnapshot,
+        'prompt_name' => $promptName,
+        'prompt_sha256' => $promptSha,
         'requested_model' => $requestedModel,
         'comparison_group' => $comparisonGroup,
+        'benchmark_header_id' => $benchmarkHeaderId,
         'status' => 'queued',
         'attempt_count' => 1,
     ]);
@@ -1071,15 +1139,33 @@ function retryDecodeJob(int $jobId, ?string $promptRelativePath = null): void
         throw new RuntimeException('Decode job not found');
     }
 
-    $promptSnapshot = createPromptSnapshotFile($promptRelativePath);
+    // A retry must re-run the *same* prompt version the job was created with, so its
+    // result stays comparable with the sibling jobs in its comparison group. Only fall
+    // back to the current active prompt when the job predates prompt provenance.
+    $existingSha = trim((string) ($job['prompt_sha256'] ?? ''));
+    $existingText = $existingSha !== '' && $promptRelativePath === null ? getPromptVersionText($existingSha) : null;
+    if ($existingText !== null) {
+        $promptSnapshot = writePromptSnapshotFile($existingText);
+        $promptName = (string) ($job['prompt_name'] ?? '');
+        $promptSha = $existingSha;
+    } else {
+        [$promptSnapshot, $promptName, $promptSha] = createPromptSnapshot($promptRelativePath);
+    }
+
     $stmt = pdo()->prepare(
         'UPDATE decode_jobs SET
          prompt_file_path = :prompt_file_path,
+         prompt_name = :prompt_name,
+         prompt_sha256 = :prompt_sha256,
          status = :status,
           error_message = NULL,
           usage_metadata_json = NULL,
           decoding_model = NULL,
           total_token_count = NULL,
+          prompt_token_count = NULL,
+          completion_token_count = NULL,
+          reasoning_token_count = NULL,
+          cost_usd = NULL,
           decoded_json = NULL,
          started_at = NULL,
          finished_at = NULL,
@@ -1091,6 +1177,8 @@ function retryDecodeJob(int $jobId, ?string $promptRelativePath = null): void
     $stmt->execute([
         'id' => $jobId,
         'prompt_file_path' => $promptSnapshot,
+        'prompt_name' => $promptName,
+        'prompt_sha256' => $promptSha,
         'status' => 'queued',
     ]);
 }
@@ -1108,7 +1196,11 @@ function listDecodeJobs(int $limit = 100, bool $includeSaved = false): array
 {
     ensureDecodeJobAnalysisColumns();
     $limit = max(1, min($limit, 500));
-    $where = $includeSaved ? 'WHERE archived = 0' : "WHERE status NOT IN ('saved', 'rejected') AND archived = 0";
+    // Benchmark re-runs are scored automatically and never need manual review, so keep
+    // them out of the job queue view entirely (they are visible on the Statistics page).
+    $where = $includeSaved
+        ? 'WHERE archived = 0 AND benchmark_header_id IS NULL'
+        : "WHERE status NOT IN ('saved', 'rejected', 'benchmarked') AND archived = 0 AND benchmark_header_id IS NULL";
     $stmt = pdo()->query(
         'SELECT id, source_image_filename, source_image_path, status, error_message,
             attempt_count, saved_header_id, requested_model, comparison_group, decoding_model, total_token_count,
@@ -1125,7 +1217,7 @@ function listDecodeJobs(int $limit = 100, bool $includeSaved = false): array
 function countPendingDecodeJobs(): int
 {
     ensureDecodeJobAnalysisColumns();
-    $stmt = pdo()->query("SELECT COUNT(*) FROM decode_jobs WHERE status NOT IN ('saved', 'rejected') AND archived = 0");
+    $stmt = pdo()->query("SELECT COUNT(*) FROM decode_jobs WHERE status NOT IN ('saved', 'rejected', 'benchmarked') AND archived = 0 AND benchmark_header_id IS NULL");
     return (int) $stmt->fetchColumn();
 }
 
@@ -1386,6 +1478,19 @@ function ensureDecodeFieldQualityTable(): void
         if (!isset($columns['updated_at'])) {
             pdo()->exec('ALTER TABLE decode_field_quality ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at');
         }
+        // 006_cost_prompt_provenance_benchmark.sql
+        $additions = [
+            'prompt_sha256' => 'CHAR(64) NULL AFTER prompt_file_path',
+            'char_distance' => 'INT UNSIGNED NULL AFTER normalized_match',
+            'inherited_from_previous' => 'TINYINT(1) NOT NULL DEFAULT 0 AFTER char_distance',
+            'predicted_decoding_status' => 'VARCHAR(16) NULL AFTER inherited_from_previous',
+            'is_benchmark' => 'TINYINT(1) NOT NULL DEFAULT 0 AFTER manually_corrected',
+        ];
+        foreach ($additions as $column => $definition) {
+            if (!isset($columns[$column])) {
+                pdo()->exec("ALTER TABLE decode_field_quality ADD COLUMN {$column} {$definition}");
+            }
+        }
     } catch (Throwable) {
     }
 
@@ -1401,6 +1506,13 @@ function decodeQualityNormalizeValue(string $field, mixed $value): string
         $text = str_replace(['/', '-', ',', ' '], '.', $text);
         $text = preg_replace('/\.+/', '.', $text) ?? $text;
         $text = trim($text, '.');
+        // Canonical d.m.Y without zero padding, so "2011-05-29", "29.05.2011" and
+        // "29.5.2011" all compare equal (a format difference, not a reading error).
+        if (preg_match('/^(\d{4})\.(\d{1,2})\.(\d{1,2})$/', $text, $m) === 1) {
+            $text = sprintf('%d.%d.%d', (int) $m[3], (int) $m[2], (int) $m[1]);
+        } elseif (preg_match('/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/', $text, $m) === 1) {
+            $text = sprintf('%d.%d.%d', (int) $m[1], (int) $m[2], (int) $m[3]);
+        }
     }
 
     return $text;
@@ -1436,138 +1548,363 @@ function decodeQualityErrorType(string $predictedNorm, string $finalNorm, bool $
     return 'mismatch';
 }
 
+const QUALITY_HEADER_KEYS = ['bird_id', 'card_code', 'sex', 'ring_position', 'ring_number', 'ringing_age', 'ringing_date', 'ringing_nest', 'scull_length', 'scull_repeat'];
+const QUALITY_CONTENT_KEYS = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes'];
+const QUALITY_RECOVERY_KEYS = ['ring_number', 'recovery_status', 'recovery_date', 'recovery_location', 'recovery_person', 'recovery_notes'];
+
+/** Fields that identify a row when aligning predicted rows to final rows (weight 1); the rest weigh 0.25. */
+const QUALITY_ROW_KEY_FIELDS = [
+    'content' => ['obs_year', 'obs_nest', 'obs_status', 'obs_notes'],
+    'recovery' => ['recovery_date', 'recovery_location', 'recovery_person', 'recovery_notes'],
+];
+
+function decodeQualityLevenshtein(string $a, string $b): int
+{
+    if ($a === $b) {
+        return 0;
+    }
+    $aChars = preg_split('//u', $a, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    $bChars = preg_split('//u', $b, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    $n = count($aChars);
+    $m = count($bChars);
+    if ($n === 0) {
+        return $m;
+    }
+    if ($m === 0) {
+        return $n;
+    }
+    $prev = range(0, $m);
+    for ($i = 1; $i <= $n; $i++) {
+        $curr = [$i];
+        for ($j = 1; $j <= $m; $j++) {
+            $cost = $aChars[$i - 1] === $bChars[$j - 1] ? 0 : 1;
+            $curr[$j] = min($prev[$j] + 1, $curr[$j - 1] + 1, $prev[$j - 1] + $cost);
+        }
+        $prev = $curr;
+    }
+
+    return $prev[$m];
+}
+
+/**
+ * Similarity in [0,1] between a predicted and a final row: weighted share of fields whose
+ * normalized values match, counting only fields that are non-empty on at least one side.
+ */
+function decodeQualityRowSimilarity(array $predRow, array $finalRow, array $keys, array $keyFields): float
+{
+    $score = 0.0;
+    $weightTotal = 0.0;
+    foreach ($keys as $field) {
+        $pred = decodeQualityNormalizeValue($field, (string) ($predRow[$field] ?? ''));
+        $final = decodeQualityNormalizeValue($field, (string) ($finalRow[$field] ?? ''));
+        if ($pred === '' && $final === '') {
+            continue;
+        }
+        $weight = in_array($field, $keyFields, true) ? 1.0 : 0.25;
+        $weightTotal += $weight;
+        if ($pred === $final) {
+            $score += $weight;
+        } elseif ($pred !== '' && $final !== '') {
+            // Partial credit for near-misses so a one-glyph error still anchors the row.
+            $dist = decodeQualityLevenshtein($pred, $final);
+            $len = max(mb_strlen($pred), mb_strlen($final));
+            if ($len > 0 && $dist / $len <= 0.34) {
+                $score += $weight * 0.5;
+            }
+        }
+    }
+
+    return $weightTotal > 0 ? $score / $weightTotal : 0.0;
+}
+
+/**
+ * Align predicted rows to final rows in order (monotone alignment, like diff) maximizing
+ * total similarity. Returns [[predIndex|null, finalIndex|null], ...]. A predicted row with
+ * no counterpart is an extra row; a final row with no counterpart is a missing row.
+ * Positional pairing (the old behaviour) turned one skipped row into a cascade of
+ * mismatches for every row after it.
+ */
+function decodeQualityAlignRows(array $predRows, array $finalRows, array $keys, array $keyFields): array
+{
+    $n = count($predRows);
+    $m = count($finalRows);
+    $minSim = 0.2;
+    $dp = array_fill(0, $n + 1, array_fill(0, $m + 1, 0.0));
+    $back = array_fill(0, $n + 1, array_fill(0, $m + 1, ''));
+    for ($i = 1; $i <= $n; $i++) {
+        $back[$i][0] = 'up';
+    }
+    for ($j = 1; $j <= $m; $j++) {
+        $back[0][$j] = 'left';
+    }
+    for ($i = 1; $i <= $n; $i++) {
+        for ($j = 1; $j <= $m; $j++) {
+            $sim = decodeQualityRowSimilarity($predRows[$i - 1], $finalRows[$j - 1], $keys, $keyFields);
+            $best = $dp[$i - 1][$j];
+            $dir = 'up';
+            if ($dp[$i][$j - 1] > $best) {
+                $best = $dp[$i][$j - 1];
+                $dir = 'left';
+            }
+            if ($sim >= $minSim && $dp[$i - 1][$j - 1] + $sim > $best) {
+                $best = $dp[$i - 1][$j - 1] + $sim;
+                $dir = 'diag';
+            }
+            $dp[$i][$j] = $best;
+            $back[$i][$j] = $dir;
+        }
+    }
+
+    $pairs = [];
+    $i = $n;
+    $j = $m;
+    while ($i > 0 || $j > 0) {
+        $dir = $back[$i][$j];
+        if ($dir === 'diag') {
+            $pairs[] = [$i - 1, $j - 1];
+            $i--;
+            $j--;
+        } elseif ($dir === 'up' || $j === 0) {
+            $pairs[] = [$i - 1, null];
+            $i--;
+        } else {
+            $pairs[] = [null, $j - 1];
+            $j--;
+        }
+    }
+
+    return array_reverse($pairs);
+}
+
+function decodeQualityFieldRow(string $section, ?int $rowNo, string $field, string $predValue, string $finalValue, ?string $rowError = null): array
+{
+    $predValue = trim($predValue);
+    $finalValue = trim($finalValue);
+    $predNorm = decodeQualityNormalizeValue($field, $predValue);
+    $finalNorm = decodeQualityNormalizeValue($field, $finalValue);
+    $normMatch = $predNorm === $finalNorm;
+    $errorType = $rowError ?? decodeQualityErrorType($predNorm, $finalNorm, $normMatch);
+    $charDistance = ($predNorm === '' && $finalNorm === '') ? null : decodeQualityLevenshtein($predNorm, $finalNorm);
+
+    return [
+        'section' => $section,
+        'row_no' => $rowNo,
+        'field_name' => $field,
+        'predicted_value' => $predValue,
+        'final_value' => $finalValue,
+        'exact_match' => (int) ($predValue === $finalValue),
+        'normalized_match' => (int) $normMatch,
+        'char_distance' => $charDistance,
+        'inherited_from_previous' => 0,
+        'predicted_decoding_status' => null,
+        'error_type' => $errorType,
+    ];
+}
+
+/**
+ * Compare one job's prediction against a final (reviewed) record and return one quality
+ * row per field. Shared by the manual "Accept and Save" flow and by benchmark re-runs.
+ *
+ * Row-level structure errors are reported as error_type 'missing_row' (final row the
+ * model did not produce) and 'extra_row' (predicted row with no counterpart); their field
+ * rows are still emitted so per-field counts stay comparable, but stats can separate them.
+ * inherited_from_previous marks ring_number/ring_position values a model carried over from
+ * the previous row (or the header for row 1), so one misread is not counted N times.
+ */
+function computeFieldQualityRows(array $decoded, array $finalDecoded): array
+{
+    // Fully blank rows carry no information on either side (an unfilled template row in
+    // the saved record, or a model echoing the empty example row), so they are ignored.
+    $nonBlank = static fn($rows, array $keys) => is_array($rows)
+        ? array_values(array_filter($rows, static fn($r) => !isBlankRow($r, $keys)))
+        : [];
+    $finalHeader = is_array($finalDecoded['header'] ?? null) ? $finalDecoded['header'] : [];
+    $finalContent = $nonBlank($finalDecoded['content'] ?? null, QUALITY_CONTENT_KEYS);
+    $finalRecovery = $nonBlank($finalDecoded['recovery'] ?? null, QUALITY_RECOVERY_KEYS);
+    $predHeader = is_array($decoded['header'] ?? null) ? $decoded['header'] : [];
+    $predContent = $nonBlank($decoded['content'] ?? null, QUALITY_CONTENT_KEYS);
+    $predRecovery = $nonBlank($decoded['recovery'] ?? null, QUALITY_RECOVERY_KEYS);
+
+    $rows = [];
+    foreach (QUALITY_HEADER_KEYS as $field) {
+        $rows[] = decodeQualityFieldRow('header', null, $field, (string) ($predHeader[$field] ?? ''), (string) ($finalHeader[$field] ?? ''));
+    }
+
+    $sections = [
+        'content' => [$predContent, $finalContent, QUALITY_CONTENT_KEYS],
+        'recovery' => [$predRecovery, $finalRecovery, QUALITY_RECOVERY_KEYS],
+    ];
+    foreach ($sections as $section => [$predRows, $finalRows, $keys]) {
+        $pairs = decodeQualityAlignRows($predRows, $finalRows, $keys, QUALITY_ROW_KEY_FIELDS[$section]);
+        $extraRowNo = count($finalRows);
+        $prevPred = $section === 'content' ? $predHeader : null;
+        foreach ($pairs as [$pi, $fi]) {
+            $predRow = $pi === null ? [] : $predRows[$pi];
+            $finalRow = $fi === null ? [] : $finalRows[$fi];
+            $rowError = null;
+            if ($pi === null) {
+                $rowError = 'missing_row';
+            } elseif ($fi === null) {
+                $rowError = 'extra_row';
+            }
+            // Extra predicted rows get row numbers after the final rows so they stay unique per job.
+            $rowNo = $fi !== null ? $fi + 1 : ++$extraRowNo;
+            $status = $pi === null ? null : trim((string) ($predRow['decoding_status'] ?? ''));
+            foreach ($keys as $field) {
+                $row = decodeQualityFieldRow($section, $rowNo, $field, (string) ($predRow[$field] ?? ''), (string) ($finalRow[$field] ?? ''), $rowError);
+                if ($status !== null && $status !== '') {
+                    $row['predicted_decoding_status'] = mb_substr($status, 0, 16);
+                }
+                if ($pi !== null && $prevPred !== null && in_array($field, ['ring_number', 'ring_position'], true)) {
+                    $predNorm = decodeQualityNormalizeValue($field, (string) ($predRow[$field] ?? ''));
+                    $prevNorm = decodeQualityNormalizeValue($field, (string) ($prevPred[$field] ?? ''));
+                    if ($predNorm !== '' && $predNorm === $prevNorm) {
+                        $row['inherited_from_previous'] = 1;
+                    }
+                }
+                $rows[] = $row;
+            }
+            if ($pi !== null) {
+                $prevPred = $predRow;
+            }
+        }
+    }
+
+    return $rows;
+}
+
+function insertFieldQualityRows(int $headerId, array $job, array $rows, bool $isBenchmark): void
+{
+    ensureDecodeFieldQualityTable();
+    $jobId = (int) ($job['id'] ?? 0);
+    $model = trim((string) ($job['decoding_model'] ?? ''));
+    if ($model === '') {
+        $model = trim((string) ($job['requested_model'] ?? ''));
+    }
+    if ($model === '') {
+        $model = 'unknown';
+    }
+
+    $insert = pdo()->prepare(
+        'INSERT INTO decode_field_quality
+            (header_id, decode_job_id, model, prompt_file_path, prompt_sha256, section, row_no, field_name,
+             predicted_value, final_value, exact_match, normalized_match, char_distance, inherited_from_previous,
+             predicted_decoding_status, manually_corrected, is_benchmark, error_type)
+         VALUES
+            (:header_id, :decode_job_id, :model, :prompt_file_path, :prompt_sha256, :section, :row_no, :field_name,
+             :predicted_value, :final_value, :exact_match, :normalized_match, :char_distance, :inherited_from_previous,
+             :predicted_decoding_status, 0, :is_benchmark, :error_type)'
+    );
+    foreach ($rows as $row) {
+        $insert->execute([
+            'header_id' => $headerId,
+            'decode_job_id' => $jobId,
+            'model' => $model,
+            'prompt_file_path' => (string) ($job['prompt_name'] ?? $job['prompt_file_path'] ?? ''),
+            'prompt_sha256' => $job['prompt_sha256'] ?? null,
+            'section' => $row['section'],
+            'row_no' => $row['row_no'],
+            'field_name' => $row['field_name'],
+            'predicted_value' => $row['predicted_value'],
+            'final_value' => $row['final_value'],
+            'exact_match' => $row['exact_match'],
+            'normalized_match' => $row['normalized_match'],
+            'char_distance' => $row['char_distance'],
+            'inherited_from_previous' => $row['inherited_from_previous'],
+            'predicted_decoding_status' => $row['predicted_decoding_status'],
+            'is_benchmark' => (int) $isBenchmark,
+            'error_type' => $row['error_type'],
+        ]);
+    }
+}
+
 function saveDecodeFieldQuality(int $headerId, array $reviewJobIds, array $finalDecoded): void
 {
     if (empty($reviewJobIds)) {
         return;
     }
 
-    ensureDecodeFieldQualityTable();
-
-    $headerKeys = ['bird_id', 'card_code', 'sex', 'ring_position', 'ring_number', 'ringing_age', 'ringing_date', 'ringing_nest', 'scull_length', 'scull_repeat'];
-    $contentKeys = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes'];
-    $recoveryKeys = ['ring_number', 'recovery_status', 'recovery_date', 'recovery_location', 'recovery_person', 'recovery_notes'];
-
-    $finalHeader = is_array($finalDecoded['header'] ?? null) ? $finalDecoded['header'] : [];
-    $finalContent = is_array($finalDecoded['content'] ?? null) ? array_values($finalDecoded['content']) : [];
-    $finalRecovery = is_array($finalDecoded['recovery'] ?? null) ? array_values($finalDecoded['recovery']) : [];
-
-    $insert = pdo()->prepare(
-        'INSERT INTO decode_field_quality
-            (header_id, decode_job_id, model, prompt_file_path, section, row_no, field_name, predicted_value, final_value, exact_match, normalized_match, manually_corrected, error_type)
-         VALUES
-            (:header_id, :decode_job_id, :model, :prompt_file_path, :section, :row_no, :field_name, :predicted_value, :final_value, :exact_match, :normalized_match, :manually_corrected, :error_type)'
-    );
-
     foreach ($reviewJobIds as $rawJobId) {
         $jobId = (int) $rawJobId;
         if ($jobId <= 0) {
             continue;
         }
-
         $job = getDecodeJob($jobId);
         if ($job === null) {
             continue;
         }
-
-        $model = trim((string) ($job['decoding_model'] ?? ''));
-        if ($model === '') {
-            $model = trim((string) ($job['requested_model'] ?? ''));
-        }
-        if ($model === '') {
-            $model = 'unknown';
-        }
-
         $decoded = json_decode((string) ($job['decoded_json'] ?? ''), true);
         if (!is_array($decoded)) {
             $decoded = [];
         }
+        insertFieldQualityRows($headerId, $job, computeFieldQualityRows($decoded, $finalDecoded), false);
+    }
+}
 
-        $predHeader = is_array($decoded['header'] ?? null) ? $decoded['header'] : [];
-        $predContent = is_array($decoded['content'] ?? null) ? array_values($decoded['content']) : [];
-        $predRecovery = is_array($decoded['recovery'] ?? null) ? array_values($decoded['recovery']) : [];
+/** Load a saved record in the same {header, content, recovery} shape the models produce. */
+function loadSavedRecordAsDecoded(int $headerId): ?array
+{
+    $stmt = pdo()->prepare('SELECT * FROM cards_header WHERE id = :id LIMIT 1');
+    $stmt->execute(['id' => $headerId]);
+    $header = $stmt->fetch();
+    if (!$header) {
+        return null;
+    }
+    $content = pdo()->prepare('SELECT ' . implode(', ', QUALITY_CONTENT_KEYS) . ' FROM cards_content WHERE header_id = :id ORDER BY row_no');
+    $content->execute(['id' => $headerId]);
+    $recovery = pdo()->prepare('SELECT ' . implode(', ', QUALITY_RECOVERY_KEYS) . ' FROM cards_recovery WHERE header_id = :id ORDER BY row_no');
+    $recovery->execute(['id' => $headerId]);
 
-        foreach ($headerKeys as $field) {
-            $predValue = trim((string) ($predHeader[$field] ?? ''));
-            $finalValue = trim((string) ($finalHeader[$field] ?? ''));
-            $predNorm = decodeQualityNormalizeValue($field, $predValue);
-            $finalNorm = decodeQualityNormalizeValue($field, $finalValue);
-            $exactMatch = (int) ($predValue === $finalValue);
-            $normMatch = (int) ($predNorm === $finalNorm);
-            $insert->execute([
-                'header_id' => $headerId,
-                'decode_job_id' => $jobId,
-                'model' => $model,
-                'prompt_file_path' => (string) ($job['prompt_file_path'] ?? ''),
-                'section' => 'header',
-                'row_no' => null,
-                'field_name' => $field,
-                'predicted_value' => $predValue,
-                'final_value' => $finalValue,
-                'exact_match' => $exactMatch,
-                'normalized_match' => $normMatch,
-                'manually_corrected' => 0,
-                'error_type' => decodeQualityErrorType($predNorm, $finalNorm, (bool) $normMatch),
-            ]);
-        }
+    $headerOut = [];
+    foreach (QUALITY_HEADER_KEYS as $field) {
+        $headerOut[$field] = (string) ($header[$field] ?? '');
+    }
 
-        $contentRowCount = max(count($predContent), count($finalContent));
-        for ($i = 0; $i < $contentRowCount; $i++) {
-            $predRow = is_array($predContent[$i] ?? null) ? $predContent[$i] : [];
-            $finalRow = is_array($finalContent[$i] ?? null) ? $finalContent[$i] : [];
-            foreach ($contentKeys as $field) {
-                $predValue = trim((string) ($predRow[$field] ?? ''));
-                $finalValue = trim((string) ($finalRow[$field] ?? ''));
-                $predNorm = decodeQualityNormalizeValue($field, $predValue);
-                $finalNorm = decodeQualityNormalizeValue($field, $finalValue);
-                $exactMatch = (int) ($predValue === $finalValue);
-                $normMatch = (int) ($predNorm === $finalNorm);
-                $insert->execute([
-                    'header_id' => $headerId,
-                    'decode_job_id' => $jobId,
-                    'model' => $model,
-                    'prompt_file_path' => (string) ($job['prompt_file_path'] ?? ''),
-                    'section' => 'content',
-                    'row_no' => $i + 1,
-                    'field_name' => $field,
-                    'predicted_value' => $predValue,
-                    'final_value' => $finalValue,
-                    'exact_match' => $exactMatch,
-                    'normalized_match' => $normMatch,
-                    'manually_corrected' => 0,
-                    'error_type' => decodeQualityErrorType($predNorm, $finalNorm, (bool) $normMatch),
-                ]);
-            }
-        }
+    return [
+        'header' => $headerOut,
+        'content' => $content->fetchAll() ?: [],
+        'recovery' => $recovery->fetchAll() ?: [],
+        'source_image_path' => (string) ($header['source_image_path'] ?? ''),
+    ];
+}
 
-        $recoveryRowCount = max(count($predRecovery), count($finalRecovery));
-        for ($i = 0; $i < $recoveryRowCount; $i++) {
-            $predRow = is_array($predRecovery[$i] ?? null) ? $predRecovery[$i] : [];
-            $finalRow = is_array($finalRecovery[$i] ?? null) ? $finalRecovery[$i] : [];
-            foreach ($recoveryKeys as $field) {
-                $predValue = trim((string) ($predRow[$field] ?? ''));
-                $finalValue = trim((string) ($finalRow[$field] ?? ''));
-                $predNorm = decodeQualityNormalizeValue($field, $predValue);
-                $finalNorm = decodeQualityNormalizeValue($field, $finalValue);
-                $exactMatch = (int) ($predValue === $finalValue);
-                $normMatch = (int) ($predNorm === $finalNorm);
-                $insert->execute([
-                    'header_id' => $headerId,
-                    'decode_job_id' => $jobId,
-                    'model' => $model,
-                    'prompt_file_path' => (string) ($job['prompt_file_path'] ?? ''),
-                    'section' => 'recovery',
-                    'row_no' => $i + 1,
-                    'field_name' => $field,
-                    'predicted_value' => $predValue,
-                    'final_value' => $finalValue,
-                    'exact_match' => $exactMatch,
-                    'normalized_match' => $normMatch,
-                    'manually_corrected' => 0,
-                    'error_type' => decodeQualityErrorType($predNorm, $finalNorm, (bool) $normMatch),
-                ]);
-            }
-        }
+/**
+ * Score a finished benchmark job against the saved record it was re-run for, then mark
+ * the job 'benchmarked' so it never shows up for manual review. Idempotent: earlier
+ * quality rows for the same job are replaced.
+ */
+function scoreBenchmarkJob(int $jobId): void
+{
+    $job = getDecodeJob($jobId);
+    if ($job === null) {
+        throw new RuntimeException("decode_jobs.id={$jobId} not found");
+    }
+    $headerId = (int) ($job['benchmark_header_id'] ?? 0);
+    if ($headerId <= 0) {
+        throw new RuntimeException("Job {$jobId} is not a benchmark job");
+    }
+    $final = loadSavedRecordAsDecoded($headerId);
+    if ($final === null) {
+        throw new RuntimeException("cards_header.id={$headerId} not found for benchmark job {$jobId}");
+    }
+    $decoded = json_decode((string) ($job['decoded_json'] ?? ''), true);
+    if (!is_array($decoded)) {
+        throw new RuntimeException("Job {$jobId} has no decoded JSON to score");
+    }
+
+    ensureDecodeFieldQualityTable();
+    $pdo = pdo();
+    $pdo->beginTransaction();
+    try {
+        $del = $pdo->prepare('DELETE FROM decode_field_quality WHERE decode_job_id = :id');
+        $del->execute(['id' => $jobId]);
+        insertFieldQualityRows($headerId, $job, computeFieldQualityRows($decoded, $final), true);
+        $upd = $pdo->prepare("UPDATE decode_jobs SET status = 'benchmarked', updated_at = CURRENT_TIMESTAMP WHERE id = :id");
+        $upd->execute(['id' => $jobId]);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
     }
 }
 
@@ -1580,7 +1917,7 @@ function refreshDecodeFieldQualityForHeader(int $headerId, array $finalDecoded):
     $finalRecovery = is_array($finalDecoded['recovery'] ?? null) ? array_values($finalDecoded['recovery']) : [];
 
     $rowsStmt = pdo()->prepare(
-        'SELECT id, section, row_no, field_name, predicted_value, final_value, manually_corrected
+        'SELECT id, section, row_no, field_name, predicted_value, final_value, manually_corrected, error_type
          FROM decode_field_quality
          WHERE header_id=:header_id'
     );
@@ -1595,6 +1932,7 @@ function refreshDecodeFieldQualityForHeader(int $headerId, array $finalDecoded):
          SET final_value=:final_value,
              exact_match=:exact_match,
              normalized_match=:normalized_match,
+             char_distance=:char_distance,
              manually_corrected=:manually_corrected,
              error_type=:error_type,
              updated_at=CURRENT_TIMESTAMP
@@ -1607,6 +1945,11 @@ function refreshDecodeFieldQualityForHeader(int $headerId, array $finalDecoded):
         $rowNo = isset($row['row_no']) ? (int) $row['row_no'] : null;
         $predValue = trim((string) ($row['predicted_value'] ?? ''));
         $oldFinalValue = trim((string) ($row['final_value'] ?? ''));
+        $oldErrorType = (string) ($row['error_type'] ?? '');
+        if ($oldErrorType === 'extra_row') {
+            // Predicted row with no counterpart in the saved record: nothing to refresh.
+            continue;
+        }
 
         $newFinalValue = '';
         if ($section === 'header') {
@@ -1628,14 +1971,18 @@ function refreshDecodeFieldQualityForHeader(int $headerId, array $finalDecoded):
 
         $valueChanged = $oldFinalValue !== $newFinalValue;
         $manualCorrected = ((int) ($row['manually_corrected'] ?? 0) === 1 || $valueChanged) ? 1 : 0;
+        $errorType = $oldErrorType === 'missing_row'
+            ? 'missing_row'
+            : decodeQualityErrorType($predNorm, $newFinalNorm, (bool) $normMatch);
 
         $update->execute([
             'id' => (int) ($row['id'] ?? 0),
             'final_value' => $newFinalValue,
             'exact_match' => $exactMatch,
             'normalized_match' => $normMatch,
+            'char_distance' => ($predNorm === '' && $newFinalNorm === '') ? null : decodeQualityLevenshtein($predNorm, $newFinalNorm),
             'manually_corrected' => $manualCorrected,
-            'error_type' => decodeQualityErrorType($predNorm, $newFinalNorm, (bool) $normMatch),
+            'error_type' => $errorType,
         ]);
     }
 }
@@ -1676,6 +2023,29 @@ function ensureDecodeJobAnalysisColumns(): void
         }
         if (!isset($columns['archived'])) {
             $pdo->exec('ALTER TABLE decode_jobs ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0');
+        }
+        // 006_cost_prompt_provenance_benchmark.sql
+        $pdo->exec(
+            'CREATE TABLE IF NOT EXISTS prompt_versions (
+                sha256 CHAR(64) PRIMARY KEY,
+                prompt_name VARCHAR(255) NOT NULL,
+                prompt_text MEDIUMTEXT NOT NULL,
+                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )'
+        );
+        $additions = [
+            'prompt_name' => 'VARCHAR(255) NULL AFTER prompt_file_path',
+            'prompt_sha256' => 'CHAR(64) NULL AFTER prompt_name',
+            'prompt_token_count' => 'INT UNSIGNED NULL AFTER total_token_count',
+            'completion_token_count' => 'INT UNSIGNED NULL AFTER prompt_token_count',
+            'reasoning_token_count' => 'INT UNSIGNED NULL AFTER completion_token_count',
+            'cost_usd' => 'DECIMAL(10, 6) NULL AFTER reasoning_token_count',
+            'benchmark_header_id' => 'BIGINT UNSIGNED NULL AFTER saved_header_id',
+        ];
+        foreach ($additions as $column => $definition) {
+            if (!isset($columns[$column])) {
+                $pdo->exec("ALTER TABLE decode_jobs ADD COLUMN {$column} {$definition}");
+            }
         }
     } catch (Throwable) {
     }

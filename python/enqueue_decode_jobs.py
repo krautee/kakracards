@@ -227,6 +227,14 @@ def ensure_prompt_path(conn, prompt_arg: str) -> Path:
     return path
 
 
+def prompt_display_name(prompt_path: Path) -> str:
+    """Same naming as the PHP side: './prompts/<file>.md' for prompts inside the repo."""
+    try:
+        return "./" + str(prompt_path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(prompt_path)
+
+
 def resolve_models(conn, requested_models: list[str]) -> list[str]:
     models = [m.strip() for m in requested_models if m and m.strip()]
     models = list(dict.fromkeys(models))
@@ -267,19 +275,45 @@ def create_prompt_snapshot(prompt_text: str) -> str:
         return tmp.name
 
 
-def create_decode_job(cur, source_path: Path, prompt_snapshot: str, model: str, comparison_group: str) -> int:
+def register_prompt_version(cur, prompt_name: str, prompt_text: str) -> str:
+    """Store the prompt text under its sha256 so results stay traceable per prompt version."""
+    sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    cur.execute(
+        """
+        INSERT INTO prompt_versions (sha256, prompt_name, prompt_text) VALUES (%s, %s, %s)
+        ON DUPLICATE KEY UPDATE prompt_name = prompt_name
+        """,
+        (sha, prompt_name, prompt_text),
+    )
+    return sha
+
+
+def create_decode_job(
+    cur,
+    source_path: Path,
+    prompt_snapshot: str,
+    model: str,
+    comparison_group: str | None,
+    prompt_name: str = "",
+    prompt_sha256: str | None = None,
+    benchmark_header_id: int | None = None,
+) -> int:
     cur.execute(
         """
         INSERT INTO decode_jobs
-        (source_image_filename, source_image_path, prompt_file_path, requested_model, comparison_group, status, attempt_count)
-        VALUES (%s, %s, %s, %s, %s, 'queued', 1)
+        (source_image_filename, source_image_path, prompt_file_path, prompt_name, prompt_sha256,
+         requested_model, comparison_group, benchmark_header_id, status, attempt_count)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', 1)
         """,
         (
             source_path.name,
             str(source_path),
             prompt_snapshot,
+            prompt_name or None,
+            prompt_sha256,
             model,
             comparison_group,
+            benchmark_header_id,
         ),
     )
     return int(cur.lastrowid)
@@ -440,6 +474,8 @@ def main() -> int:
 
         prompt_path = ensure_prompt_path(conn, args.prompt_file)
         prompt_text = prompt_path.read_text(encoding="utf-8")
+        prompt_name = prompt_display_name(prompt_path)
+        prompt_sha = register_prompt_version(cur, prompt_name, prompt_text)
         models = resolve_models(conn, args.model)
 
         work_items = expand_to_work_items(allowed, logger)
@@ -460,7 +496,7 @@ def main() -> int:
             comparison_group = hashlib.md5(f"{item}-{os.getpid()}".encode("utf-8")).hexdigest()
             for model in models:
                 snapshot = create_prompt_snapshot(prompt_text)
-                job_id = create_decode_job(cur, item, snapshot, model, comparison_group)
+                job_id = create_decode_job(cur, item, snapshot, model, comparison_group, prompt_name, prompt_sha)
                 created_jobs.append(job_id)
                 logger.info("Queued job_id=%s file=%s model=%s group=%s", job_id, item, model, comparison_group)
                 if args.verbose:

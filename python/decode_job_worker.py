@@ -2,12 +2,15 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import mysql.connector
 
 import decode_cards
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def db_connection():
@@ -29,7 +32,7 @@ def parse_args() -> argparse.Namespace:
 def load_job(cur, job_id: int):
     cur.execute(
         """
-        SELECT id, source_image_path, prompt_file_path, requested_model, status
+        SELECT id, source_image_path, prompt_file_path, requested_model, status, benchmark_header_id
         FROM decode_jobs
         WHERE id=%s
         LIMIT 1
@@ -37,6 +40,20 @@ def load_job(cur, job_id: int):
         (job_id,),
     )
     return cur.fetchone()
+
+
+def score_benchmark_job(job_id: int) -> None:
+    php_bin = os.getenv("PHP_BIN", "php").strip() or "php"
+    script = ROOT / "public" / "score_benchmark_job.php"
+    proc = subprocess.run(
+        [php_bin, str(script), "--job-id", str(job_id)],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(f"Benchmark scoring failed: {detail[:1500]}")
 
 
 def main() -> int:
@@ -74,8 +91,10 @@ def main() -> int:
         )
         decoded = result["decoded"]
         usage_metadata = result["usageMetadata"]
-        model = str(result.get("model") or requested_model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")).strip()
+        requested = str(result.get("model") or requested_model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")).strip()
+        model = str(result.get("resolvedModel") or requested).strip() or requested
         total_token_count = int(usage_metadata.get("totalTokenCount") or 0)
+        cost = usage_metadata.get("costUsd")
 
         cur.execute(
             """
@@ -85,6 +104,10 @@ def main() -> int:
                 usage_metadata_json=%s,
                 decoding_model=%s,
                 total_token_count=%s,
+                prompt_token_count=%s,
+                completion_token_count=%s,
+                reasoning_token_count=%s,
+                cost_usd=%s,
                 finished_at=NOW(),
                 updated_at=NOW()
             WHERE id=%s
@@ -94,6 +117,10 @@ def main() -> int:
                 json.dumps(usage_metadata, ensure_ascii=False),
                 model,
                 total_token_count,
+                int(usage_metadata.get("promptTokenCount") or 0),
+                int(usage_metadata.get("candidatesTokenCount") or 0),
+                int(usage_metadata.get("thoughtsTokenCount") or 0),
+                float(cost) if isinstance(cost, (int, float)) else None,
                 args.job_id,
             ),
         )
@@ -103,6 +130,11 @@ def main() -> int:
                 os.unlink(prompt_file)
             except OSError:
                 pass
+
+        # Benchmark jobs are scored automatically against the already-reviewed record;
+        # the scoring logic lives in PHP (shared with the manual review flow), so hand off.
+        if job.get("benchmark_header_id"):
+            score_benchmark_job(args.job_id)
         return 0
 
     except Exception as exc:
