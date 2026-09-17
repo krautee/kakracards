@@ -15,7 +15,8 @@ You are an expert data transcription assistant. Your goal is to decode scanned h
 - Sex should always be decoded and stored as M (male) and F (female)
 - Scull length should always be a numeric, without letters, with suitable decimal separator (.)
 - Always remove spaces from status column.
-- In Status column circle-like shape is always small o (not zero or capital O). 
+- In Status column circle-like shape is always small o (not zero or capital O).
+- In Status column V shape is always capital V.
 - Decode ring number always as LettersNumbers without spaces and punctuation marks. If any punctuation marks appear, copy the whole ring number string to Notes.
 - 
 
