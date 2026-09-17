@@ -29,20 +29,34 @@ It combines OCR and LLM-assisted decoding, then lets you review, compare, and co
 - Date fields in editor/review support calendar popup behavior for ringing and recovery dates.
 - Content and recovery rows support add, insert, and delete controls directly in table UI.
 
-## Quality tracking and statistics
+## Quality tracking, benchmarking and statistics
 
-- Saving reviewed records stores per-field quality metrics in `decode_field_quality`.
-- Manual corrections are tracked and reflected in stats.
-- Statistics page summarizes:
-	- per-model token/time performance
-	- normalized/exact match rates
-	- manual correction rates
-	- weakest model/field pairs for prompt tuning
+- Every saved record is human-verified ground truth. Saving a reviewed record scores
+  each model's output against it, field by field, into `decode_field_quality`.
+- **Benchmark re-runs** (`python/benchmark.py`) decode already-reviewed cards again with
+  any model or prompt version and score them automatically — no manual review needed.
+  This is how new models and prompt versions are evaluated:
+
+  ```bash
+  python3 python/benchmark.py --model anthropic/claude-opus-5 --model x-ai/grok-4.6 --dry-run   # plan + cost estimate
+  python3 python/benchmark.py --model anthropic/claude-opus-5 --model x-ai/grok-4.6             # run
+  python3 python/benchmark.py --prompt prompts/paigutus_v2.md --model gemini-3.1-pro-preview   # try a prompt version
+  ```
+
+- Every job records the prompt version (sha256, text kept in `prompt_versions`), the
+  measured or estimated cost in USD, and prompt/answer/reasoning token counts.
+- The Statistics page compares models on a common card set (paired mode) and shows
+  accuracy, unique-error accuracy, row recall/precision, omission vs hallucination,
+  null-field accuracy, character error rate, calibration of the model's own OK/CHECK
+  flags, cost per card, a per-field heatmap, a confusion report of the most frequent
+  misreadings (the input for prompt tuning) and accuracy per prompt version.
+- `php public/rescore_quality.php --all` rescores historical rows after scoring changes.
 
 Migrations related to these features:
 
 - `db/migrations/004_decode_field_quality.sql`
 - `db/migrations/005_decode_field_quality_manual_corrections.sql`
+- `db/migrations/006_cost_prompt_provenance_benchmark.sql`
 
 ## Architecture at a glance
 

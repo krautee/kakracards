@@ -1501,8 +1501,20 @@ function decodeQualityNormalizeValue(string $field, mixed $value): string
 {
     $text = strtolower(trim((string) $value));
     $text = preg_replace('/\s+/', ' ', $text) ?? $text;
+    // Glyph variants that mean the same thing on these cards.
+    $text = str_replace(['→', '−', '–'], ['->', '-', '-'], $text);
+
+    if ($field === 'sex') {
+        $text = str_replace(['♀', '♂'], ['f', 'm'], $text);
+    }
 
     if (in_array($field, ['ringing_date', 'recovery_date'], true)) {
+        // Two-digit years as written on the cards: 21 -> 2021, 98 -> 1998 (same rule as the prompt).
+        $text = preg_replace_callback(
+            '/^(\d{1,2}[.\/-]\d{1,2}[.\/-])(\d{2})$/',
+            static fn(array $m) => $m[1] . ((int) $m[2] < 30 ? '20' : '19') . $m[2],
+            $text
+        ) ?? $text;
         $text = str_replace(['/', '-', ',', ' '], '.', $text);
         $text = preg_replace('/\.+/', '.', $text) ?? $text;
         $text = trim($text, '.');

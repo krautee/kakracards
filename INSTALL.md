@@ -15,13 +15,17 @@ Update `.env` with:
 - optional `GEMINI_MODEL` and paths
 - optional `OPENROUTER_API_KEY` + `OPENROUTER_MODELS` to also compare OpenRouter models
   (e.g. Claude, GPT, Qwen) alongside Gemini — see "Adding OpenRouter models" below
+- optional `OPENROUTER_REASONING_EFFORT` (default `low`) to cap hidden reasoning tokens
+  on reasoning-capable models, and `LLM_HTTP_RETRIES` (default 3) for transient errors
 
 ## 2) Create MySQL schema
 
 ```bash
-mysql -h <host> -u <user> -p <database> < db/migrations/001_initial.sql
-mysql -h <host> -u <user> -p <database> < db/migrations/002_decode_jobs.sql
+for f in db/migrations/*.sql; do mysql -h <host> -u <user> -p <database> < "$f"; done
 ```
+
+(The PHP side also adds missing columns on first use, but running the migrations is the
+documented path.)
 
 ## 3) Python CLI environment
 
@@ -96,3 +100,19 @@ The model string itself decides routing: anything containing a `/` goes to OpenR
 anything without one is treated as a bare Gemini model id. Everything downstream —
 job status, the model-comparison review UI, and the Statistics page's token/accuracy
 tracking — works the same regardless of provider, since it's all keyed off that string.
+
+## Benchmarking models and prompts
+
+Reviewed records are ground truth, so a model or prompt can be evaluated without any
+manual work:
+
+```bash
+python3 python/benchmark.py --model openai/gpt-6-astra --model deepseek/deepseek-v4.1-flash --dry-run
+python3 python/benchmark.py --model openai/gpt-6-astra --model deepseek/deepseek-v4.1-flash -y --concurrency 3
+python3 python/benchmark.py --prompt prompts/paigutus_v2.md --model gemini-3.1-pro-preview
+```
+
+Results appear on `stats.php` (choose "Benchmark re-runs only" and a prompt version).
+Cost per card is measured by OpenRouter; for Gemini it is estimated from
+`python/model_pricing.json`, which `python3 python/refresh_model_pricing.py` regenerates
+from OpenRouter's public catalog.
