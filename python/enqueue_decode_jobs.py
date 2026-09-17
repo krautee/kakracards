@@ -33,7 +33,8 @@ def parse_args() -> argparse.Namespace:
         "--model",
         action="append",
         default=[],
-        help="Gemini model to use; can be repeated",
+        help="Model to use; can be repeated. Gemini model id (e.g. gemini-2.5-flash) "
+        "or OpenRouter model id containing a slash (e.g. anthropic/claude-sonnet-4.5)",
     )
     parser.add_argument(
         "--prompt",

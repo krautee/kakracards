@@ -54,19 +54,25 @@ Migrations related to these features:
 ## Notes
 
 - Background workers are started from the web layer and process decode jobs asynchronously.
-- Preferred Gemini models and prompt selection are configurable from the settings page.
+- Preferred models and prompt selection are configurable from the settings page.
 - Source images are preserved so saved records remain traceable to the original card image.
+- Gemini is called directly; any other provider's model (Claude, GPT, Qwen, etc.) is
+  reached through [OpenRouter](https://openrouter.ai) using a curated model allow-list.
+  See `INSTALL.md` → "Adding OpenRouter models". A model string containing a `/` is
+  routed to OpenRouter; comparison, review, and the Statistics page work the same
+  regardless of which provider produced a result.
 
 ## CLI enqueue (phase 1)
 
 You can enqueue decode jobs from CLI and keep using the browser for live progress and review.
 
-Example with explicit models:
+Example with explicit models, mixing Gemini and OpenRouter:
 
 ```bash
 python3 python/enqueue_decode_jobs.py uploads/card1.jpg uploads/card2*.jpg \
 	--model=gemini-2.5-flash \
-	--model=gemini-3.1-pro
+	--model=gemini-3.1-pro \
+	--model=anthropic/claude-sonnet-4.5
 ```
 
 Behavior:

@@ -13,6 +13,8 @@ Update `.env` with:
 - optional `GEMINI_TIMEOUT_SEC` (seconds, default `180`)
 - optional `PHP_BIN` (CLI binary, default `php`)
 - optional `GEMINI_MODEL` and paths
+- optional `OPENROUTER_API_KEY` + `OPENROUTER_MODELS` to also compare OpenRouter models
+  (e.g. Claude, GPT, Qwen) alongside Gemini — see "Adding OpenRouter models" below
 
 ## 2) Create MySQL schema
 
@@ -72,3 +74,25 @@ be converted to images during queueing.
 - Gemini response constrained to `application/json`
 - shared stable prompt from file/settings
 - temperature set to `0` for deterministic compact output
+
+## Adding OpenRouter models
+
+Gemini is called directly; any other model (Claude, GPT, Qwen, etc.) goes through
+[OpenRouter](https://openrouter.ai), which exposes them behind one OpenAI-compatible API.
+
+1. Set `OPENROUTER_API_KEY` in `.env`.
+2. Set `OPENROUTER_MODELS` to a comma-separated list of OpenRouter model ids (each is
+   always `<vendor>/<name>`, e.g. `anthropic/claude-sonnet-4.5`). This is a deliberate
+   allow-list, not OpenRouter's full catalog — every model you add here is one more
+   paid API call per card whenever it's selected for a comparison run.
+3. Reopen Settings — the listed models now appear as checkboxes next to Gemini's, and
+   checking them adds them to the preferred/default model set used on the Upload page.
+4. From the CLI, use the same `--model` flag as Gemini:
+   ```bash
+   python3 python/enqueue_decode_jobs.py uploads/card1.jpg --model=anthropic/claude-sonnet-4.5
+   ```
+
+The model string itself decides routing: anything containing a `/` goes to OpenRouter,
+anything without one is treated as a bare Gemini model id. Everything downstream —
+job status, the model-comparison review UI, and the Statistics page's token/accuracy
+tracking — works the same regardless of provider, since it's all keyed off that string.

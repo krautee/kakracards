@@ -36,7 +36,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 $promptText = getPromptTextFromRelativePath($selectedPromptFile);
-$geminiModels = allowedGeminiModels();
+$availableModels = allowedModels();
 $preferredModels = preferredGeminiModels();
 ?>
 <!doctype html>
@@ -61,16 +61,16 @@ $preferredModels = preferredGeminiModels();
     <input id="prompt_filename" name="prompt_filename" type="text" placeholder="my_prompt.md">
   </p>
   <details style="border:1px solid #c7ced6; border-radius:10px; margin-bottom:16px; background:#f8fafc;" id="preferred-models-details">
-    <summary style="font-weight:bold; padding:12px; cursor:pointer; user-select:none;"><strong>Preferred Gemini models</strong></summary>
+    <summary style="font-weight:bold; padding:12px; cursor:pointer; user-select:none;"><strong>Preferred models</strong> (Gemini + OpenRouter)</summary>
     <div style="padding:0 12px 12px 12px; display:flex; flex-direction:column; gap:6px;">
-      <?php foreach ($geminiModels as $model): ?>
+      <?php foreach ($availableModels as $model): ?>
         <label style="display:flex; align-items:center; gap:8px;">
           <input type="checkbox" name="gemini_models[]" value="<?= h($model) ?>" <?= in_array($model, $preferredModels, true) ? 'checked' : '' ?>>
           <?= h($model) ?>
         </label>
       <?php endforeach; ?>
-      <?php if (empty($geminiModels)): ?>
-        <p style="margin:10px 0 0;color:#a00;">Unable to fetch available models from the Gemini API. Please check your API key or network.</p>
+      <?php if (empty($availableModels)): ?>
+        <p style="margin:10px 0 0;color:#a00;">Unable to fetch any models. Check GEMINI_API_KEY / OPENROUTER_API_KEY and OPENROUTER_MODELS in .env.</p>
       <?php endif; ?>
     </div>
   </details>

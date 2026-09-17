@@ -34,6 +34,30 @@ def read_prompt(prompt_file: str | None) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _parse_json_object(text: str, provider: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{provider} response is not a JSON object")
+    return parsed
+
+
+def call_model(image_path: Path, prompt_text: str, model_override: str | None = None) -> dict:
+    """Dispatch a decode request to the right provider based on the model name.
+
+    OpenRouter model ids are always "<vendor>/<name>" (e.g. "anthropic/claude-sonnet-4.5",
+    "qwen/qwen2.5-vl-72b-instruct"), while Gemini's own model ids never contain a slash
+    (e.g. "gemini-2.5-flash"). That distinction is used to route the call without needing
+    an extra prefix convention.
+    """
+    model = (model_override or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")).strip()
+    if "/" in model:
+        return call_openrouter(image_path, prompt_text, model)
+    return call_gemini(image_path, prompt_text, model)
+
+
 def call_gemini(image_path: Path, prompt_text: str, model_override: str | None = None) -> dict:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -76,12 +100,8 @@ def call_gemini(image_path: Path, prompt_text: str, model_override: str | None =
         raise RuntimeError(f"Gemini read timed out after {timeout_sec}s") from exc
 
     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])
-    text = parts[0].get("text", "{}").strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    parsed = json.loads(text)
-    if not isinstance(parsed, dict):
-        raise RuntimeError("Gemini response is not a JSON object")
+    text = parts[0].get("text", "{}")
+    parsed = _parse_json_object(text, "Gemini")
 
     usage_metadata = data.get("usageMetadata")
     if not isinstance(usage_metadata, dict):
@@ -91,6 +111,80 @@ def call_gemini(image_path: Path, prompt_text: str, model_override: str | None =
         "decoded": parsed,
         "usageMetadata": usage_metadata,
         "model": model,
+    }
+
+
+def call_openrouter(image_path: Path, prompt_text: str, model: str) -> dict:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is required")
+
+    timeout_sec = int(os.getenv("OPENROUTER_TIMEOUT_SEC", os.getenv("GEMINI_TIMEOUT_SEC", "180")))
+    mime_type = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
+    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
+                    },
+                ],
+            }
+        ],
+    }
+    request = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": os.getenv("APP_BASE_URL", "http://localhost"),
+            "X-Title": "KakraCards",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenRouter API error: {body}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"OpenRouter read timed out after {timeout_sec}s") from exc
+
+    if isinstance(data.get("error"), dict):
+        raise RuntimeError(f"OpenRouter API error: {data['error']}")
+
+    choices = data.get("choices") or [{}]
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    content = message.get("content", "{}")
+    if isinstance(content, list):
+        content = "".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict)
+        )
+    parsed = _parse_json_object(str(content), "OpenRouter")
+
+    usage = data.get("usage")
+    usage_metadata = {}
+    if isinstance(usage, dict):
+        usage_metadata = {
+            "totalTokenCount": int(usage.get("total_tokens") or 0),
+            "promptTokenCount": int(usage.get("prompt_tokens") or 0),
+            "candidatesTokenCount": int(usage.get("completion_tokens") or 0),
+        }
+
+    return {
+        "decoded": parsed,
+        "usageMetadata": usage_metadata,
+        "model": str(data.get("model") or model),
     }
 
 
@@ -202,7 +296,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Decode Kakra cards with Gemini API")
     parser.add_argument("--image", nargs="+", required=True, help="Path(s) to card image(s)")
     parser.add_argument("--prompt-file", help="Prompt markdown file path")
-    parser.add_argument("--model", help="Gemini model to use for this run")
+    parser.add_argument(
+        "--model",
+        help="Model to use for this run: a Gemini model id (e.g. gemini-2.5-flash) "
+        "or an OpenRouter model id containing a slash (e.g. anthropic/claude-sonnet-4.5)",
+    )
     parser.add_argument("--no-db", action="store_true", help="Do not insert results to MySQL")
     parser.add_argument("--json", action="store_true", help="Print JSON output")
     return parser.parse_args()
@@ -219,7 +317,7 @@ def main() -> int:
         results = []
         for img in args.image:
             image_path = Path(img).resolve()
-            result = call_gemini(image_path, prompt_text, args.model)
+            result = call_model(image_path, prompt_text, args.model)
             decoded = result["decoded"]
             entry = {
                 "image": str(image_path),

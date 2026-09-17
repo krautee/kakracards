@@ -67,7 +67,7 @@ def main() -> int:
         prompt_file = str(job.get("prompt_file_path") or "")
         prompt_text = decode_cards.read_prompt(prompt_file)
         requested_model = str(job.get("requested_model") or "").strip() or None
-        result = decode_cards.call_gemini(
+        result = decode_cards.call_model(
             Path(str(job["source_image_path"])).resolve(),
             prompt_text,
             requested_model,

@@ -388,7 +388,7 @@ function usageMetadataFields(array $usageMetadata): array
           <th>Elapsed</th>
           <th>Action</th>
           <th>Error</th>
-          <th>Delete</th>
+          <th>Retry / Delete</th>
         </tr>
       </thead>
       <tbody id="jobs-body">
@@ -722,10 +722,15 @@ function usageMetadataFields(array $usageMetadata): array
     return '<span style="color:#6b7280;">-</span>';
   }
 
-  function deleteHtml(job) {
+  function rowRetryDeleteHtml(job) {
     const status = String(job.status || 'queued');
     if (status === 'failed') {
-      return '<button class="tiny-btn delete-btn" data-id="' + Number(job.id) + '" type="button" title="Delete this failed job">[x]</button>';
+      // Per-row retry: the group-level Action column can show "Review" instead of
+      // "Retry" when other models in the same comparison group already succeeded,
+      // so this failed row needs its own retry control regardless of group state
+      // (e.g. transient network errors like DNS resolution failures on one model).
+      return '<button class="tiny-btn retry-btn" data-id="' + Number(job.id) + '" type="button" title="Retry this failed job">Retry</button> '
+        + '<button class="tiny-btn delete-btn" data-id="' + Number(job.id) + '" type="button" title="Delete this failed job">[x]</button>';
     }
     return '<span style="color:#d1d5db;">-</span>';
   }
@@ -768,7 +773,7 @@ function usageMetadataFields(array $usageMetadata): array
           row += '<td rowspan="' + rowSpan + '">' + groupedActionHtml(groupJobs) + '</td>';
         }
         row += '<td>' + esc(job.error_message || '') + '</td>'
-          + '<td>' + deleteHtml(job) + '</td>'
+          + '<td>' + rowRetryDeleteHtml(job) + '</td>'
           + '</tr>';
         rows.push(row);
       });
@@ -1135,6 +1140,7 @@ function usageMetadataFields(array $usageMetadata): array
     const cCols = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes'];
     const cHead = ['Position', 'Number', 'Status', 'Year', 'Nest', 'Notes', 'Ins', 'Del'];
     html += `<div class="section"><fieldset><legend>Content rows</legend>`;
+    html += `<div style="overflow-x:auto;">`;
     html += `<table style="width:100%;border-collapse:collapse;margin-top:8px;">`;
     html += `<thead><tr style="background:#f6f9fc;">`;
     cHead.forEach(h => html += `<th style="border:1px solid #d7dce2;padding:8px;text-align:left;font-weight:700;font-size:0.85rem;">${h}</th>`);
@@ -1152,12 +1158,13 @@ function usageMetadataFields(array $usageMetadata): array
         html += `</tr>`;
       });
     }
-    html += `</tbody></table><div style="margin-top:8px;"><button type="button" class="tiny-btn btn-add-content-row">+ Add content row</button></div></fieldset></div>`;
+    html += `</tbody></table></div><div style="margin-top:8px;"><button type="button" class="tiny-btn btn-add-content-row">+ Add content row</button></div></fieldset></div>`;
 
     // Recovery
     const rCols = ['ring_number', 'recovery_status', 'recovery_date', 'recovery_location', 'recovery_person', 'recovery_notes'];
     const rHead = ['Number', 'Status', 'Date', 'Location', 'Person', 'Notes', 'Ins', 'Del'];
     html += `<div class="section"><fieldset><legend>Recovery rows</legend>`;
+    html += `<div style="overflow-x:auto;">`;
     html += `<table style="width:100%;border-collapse:collapse;margin-top:8px;">`;
     html += `<thead><tr style="background:#f6f9fc;">`;
     rHead.forEach(h => html += `<th style="border:1px solid #d7dce2;padding:8px;text-align:left;font-weight:700;font-size:0.85rem;">${h}</th>`);
@@ -1175,7 +1182,7 @@ function usageMetadataFields(array $usageMetadata): array
         html += `</tr>`;
       });
     }
-    html += `</tbody></table><div style="margin-top:8px;"><button type="button" class="tiny-btn btn-add-recovery-row">+ Add recovery row</button></div></fieldset></div>`;
+    html += `</tbody></table></div><div style="margin-top:8px;"><button type="button" class="tiny-btn btn-add-recovery-row">+ Add recovery row</button></div></fieldset></div>`;
 
     editor.innerHTML = html;
 

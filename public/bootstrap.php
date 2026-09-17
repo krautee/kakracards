@@ -84,6 +84,36 @@ function allowedGeminiModels(): array
     ];
 }
 
+function allowedOpenRouterModels(): array
+{
+    $apiKey = trim((string) envValue('OPENROUTER_API_KEY', ''));
+    if ($apiKey === '') {
+        return [];
+    }
+
+    $configured = trim((string) envValue('OPENROUTER_MODELS', ''));
+    if ($configured === '') {
+        return [];
+    }
+
+    $models = array_values(array_filter(
+        array_map('trim', explode(',', $configured)),
+        static fn($value) => $value !== ''
+    ));
+
+    return array_values(array_unique($models));
+}
+
+/**
+ * Combined model allow-list across every configured provider (Gemini + OpenRouter).
+ * Use this — not allowedGeminiModels() — anywhere a selection is validated or the
+ * full pickable list is shown, so non-Gemini models aren't silently rejected.
+ */
+function allowedModels(): array
+{
+    return array_values(array_unique(array_merge(allowedGeminiModels(), allowedOpenRouterModels())));
+}
+
 function geminiAvailableModels(): array
 {
     $apiKey = trim((string) envValue('GEMINI_API_KEY', ''));
@@ -140,7 +170,7 @@ function preferredGeminiModels(): array
 
 function savePreferredGeminiModels(array $models): void
 {
-    $available = allowedGeminiModels();
+    $available = allowedModels();
     $selected = [];
     foreach ($models as $model) {
         $model = trim((string) $model);
@@ -150,7 +180,7 @@ function savePreferredGeminiModels(array $models): void
     }
     $selected = array_values(array_unique($selected));
     if (empty($selected)) {
-        throw new RuntimeException('Select at least one Gemini model');
+        throw new RuntimeException('Select at least one model');
     }
 
     $stmt = pdo()->prepare(
@@ -164,7 +194,19 @@ function savePreferredGeminiModels(array $models): void
         'value_update' => $json,
     ]);
 
-    saveGeminiModel($selected[0]);
+    // GEMINI_MODEL is only a last-resort CLI fallback for bare Gemini calls, so only
+    // update it when at least one selected model is actually a Gemini model — an
+    // OpenRouter-only selection should not touch it.
+    $firstGeminiModel = null;
+    foreach ($selected as $model) {
+        if (in_array($model, allowedGeminiModels(), true)) {
+            $firstGeminiModel = $model;
+            break;
+        }
+    }
+    if ($firstGeminiModel !== null) {
+        saveGeminiModel($firstGeminiModel);
+    }
 }
 
 function currentGeminiModel(): string
@@ -350,7 +392,7 @@ function saveGeminiModel(string $model): void
 function normalizedModelSelection(array|string|null $selection): array
 {
     $values = is_array($selection) ? $selection : [$selection];
-    $available = allowedGeminiModels();
+    $available = allowedModels();
     $models = [];
     foreach ($values as $model) {
         $model = trim((string) $model);
@@ -709,7 +751,8 @@ function renderContentRowsTable(array $rows): string
     $columns = ['ring_position', 'ring_number', 'obs_status', 'obs_year', 'obs_nest', 'obs_notes'];
     $headers = ['Position', 'Number', 'Status', 'Year', 'Nest', 'Notes'];
 
-    $html = '<table style="width:100%;border-collapse:collapse;margin-top:8px;" class="editable-table content-rows">';
+    $html = '<div style="overflow-x:auto;">';
+    $html .= '<table style="width:100%;border-collapse:collapse;margin-top:8px;" class="editable-table content-rows">';
     $html .= '<thead><tr style="background:#f6f9fc;">';
     foreach ($headers as $h) {
         $html .= '<th style="border:1px solid #d7dce2;padding:8px;text-align:left;font-weight:700;font-size:0.85rem;">' . h($h) . '</th>';
@@ -733,7 +776,7 @@ function renderContentRowsTable(array $rows): string
         }
     }
 
-    $html .= '</tbody></table>';
+    $html .= '</tbody></table></div>';
     $html .= '<button type="button" class="btn-add-content-row" style="margin-top:8px;padding:6px 12px;background:#e8f0f7;border:1px solid #c7ced6;border-radius:6px;cursor:pointer;font-size:0.9rem;">+ Add row</button>';
     return $html;
 }
@@ -743,7 +786,8 @@ function renderRecoveryRowsTable(array $rows): string
     $columns = ['ring_number', 'recovery_status', 'recovery_date', 'recovery_location', 'recovery_person', 'recovery_notes'];
     $headers = ['Number', 'Status', 'Date', 'Location', 'Person', 'Notes'];
 
-    $html = '<table style="width:100%;border-collapse:collapse;margin-top:8px;" class="editable-table recovery-rows">';
+    $html = '<div style="overflow-x:auto;">';
+    $html .= '<table style="width:100%;border-collapse:collapse;margin-top:8px;" class="editable-table recovery-rows">';
     $html .= '<thead><tr style="background:#f6f9fc;">';
     foreach ($headers as $h) {
         $html .= '<th style="border:1px solid #d7dce2;padding:8px;text-align:left;font-weight:700;font-size:0.85rem;">' . h($h) . '</th>';
@@ -771,7 +815,7 @@ function renderRecoveryRowsTable(array $rows): string
         }
     }
 
-    $html .= '</tbody></table>';
+    $html .= '</tbody></table></div>';
     $html .= '<button type="button" class="btn-add-recovery-row" style="margin-top:8px;padding:6px 12px;background:#e8f0f7;border:1px solid #c7ced6;border-radius:6px;cursor:pointer;font-size:0.9rem;">+ Add row</button>';
     return $html;
 }
