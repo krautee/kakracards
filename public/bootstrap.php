@@ -1507,6 +1507,10 @@ function decodeQualityNormalizeValue(string $field, mixed $value): string
     if ($field === 'sex') {
         $text = str_replace(['♀', '♂'], ['f', 'm'], $text);
     }
+    if ($field === 'scull_repeat') {
+        // Reviewers wrote both "ns-" and "ns -" for the same mark.
+        $text = preg_replace('/\s*-\s*/', '-', $text) ?? $text;
+    }
 
     if (in_array($field, ['ringing_date', 'recovery_date'], true)) {
         // Two-digit years as written on the cards: 21 -> 2021, 98 -> 1998 (same rule as the prompt).
