@@ -14,7 +14,46 @@ if ($id <= 0) {
 $message = '';
 $error = '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if ((string) ($_GET['action'] ?? '') === 'benchmark_status') {
+    $pending = 0;
+    foreach (listBenchmarkJobsForHeader($id) as $job) {
+        if (in_array((string) $job['status'], ['queued', 'running', 'succeeded'], true)) {
+            $pending++;
+        }
+    }
+    header('Content-Type: application/json');
+    echo json_encode(['pending' => $pending]);
+    exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['benchmark_run'])) {
+    try {
+        $promptChoice = trim((string) ($_POST['benchmark_prompt'] ?? ''));
+        $jobIds = startBenchmarkForHeader($id, (array) ($_POST['benchmark_models'] ?? []), $promptChoice !== '' ? $promptChoice : null);
+        header('Location: edit.php?id=' . $id . '&bench=' . count($jobIds) . '#benchmark');
+        exit;
+    } catch (Throwable $e) {
+        $error = 'Benchmark not started: ' . $e->getMessage();
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['benchmark_retry'])) {
+    $retryId = (int) ($_POST['benchmark_retry'] ?? 0);
+    try {
+        $job = getDecodeJob($retryId);
+        if ($job === null || (int) ($job['benchmark_header_id'] ?? 0) !== $id) {
+            throw new RuntimeException('Unknown benchmark job');
+        }
+        retryDecodeJob($retryId);
+        startDecodeJobWorker($retryId);
+        header('Location: edit.php?id=' . $id . '#benchmark');
+        exit;
+    } catch (Throwable $e) {
+        $error = 'Retry failed: ' . $e->getMessage();
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['benchmark_run']) && !isset($_POST['benchmark_retry'])) {
     $decoded = [
         'header' => [
             'bird_id' => trim((string) ($_POST['bird_id'] ?? '')),
@@ -61,6 +100,35 @@ $recoveryRows = $recoveryStmt->fetchAll();
 $uncertaintiesText = (string) ($header['uncertainties'] ?? '');
 $ringingDateValue = formatDateForEditor((string) ($header['ringing_date'] ?? ''));
 $ringingDateHasFullDate = preg_match('/^\d{2}\.\d{2}\.\d{4}$/', $ringingDateValue) === 1;
+
+if ((int) ($_GET['bench'] ?? 0) > 0) {
+    $message = 'Benchmark started for ' . (int) $_GET['bench'] . ' model(s). Results appear below when the workers finish; the saved values are not changed.';
+}
+
+$benchmarkJobs = listBenchmarkJobsForHeader($id);
+$benchmarkPending = count(array_filter($benchmarkJobs, static fn($j) => in_array((string) $j['status'], ['queued', 'running', 'succeeded'], true)));
+$benchmarkScoredIds = array_map(static fn($j) => (int) $j['id'], array_filter($benchmarkJobs, static fn($j) => (string) $j['status'] === 'benchmarked'));
+usort($benchmarkJobs, static fn($a, $b) => (($b['accuracy'] ?? -1) <=> ($a['accuracy'] ?? -1)) ?: ((int) $b['id'] <=> (int) $a['id']));
+$benchmarkMatrix = benchmarkMatrixForHeader($id, $benchmarkScoredIds);
+$benchmarkModels = preferredGeminiModels();
+$promptFiles = listPromptFiles();
+$activePromptFile = getCurrentPromptFileRelativePath();
+$imageOnDisk = is_file((string) ($header['source_image_path'] ?? ''));
+
+function benchCellStyle(?array $cell): string
+{
+    if ($cell === null) {
+        return 'background:#f8fafc;color:#94a3b8';
+    }
+    if ($cell['match']) {
+        return $cell['error_type'] === 'both_empty' ? 'background:#f8fafc;color:#94a3b8' : 'background:#dcfce7';
+    }
+    return match ($cell['error_type']) {
+        'format_mismatch' => 'background:#fef9c3',
+        'missing', 'missing_row' => 'background:#fee2e2;color:#991b1b',
+        default => 'background:#fecaca',
+    };
+}
 ?>
 <!doctype html>
 <html lang="en">
@@ -96,6 +164,20 @@ $ringingDateHasFullDate = preg_match('/^\d{2}\.\d{2}\.\d{4}$/', $ringingDateValu
     .actions button:hover{background:#123e72}
     .editable-table input{margin:0}
     .btn-del-row:hover{background:#ffe0e0 !important}
+    .bench-form{display:flex;flex-wrap:wrap;gap:14px;align-items:end}
+    .bench-models{display:flex;flex-wrap:wrap;gap:6px 14px}
+    .bench-models label{font-size:.9rem;display:flex;align-items:center;gap:6px}
+    .bench-form select{width:auto;min-width:260px}
+    .bench-table{border-collapse:collapse;width:100%;font-size:.85rem}
+    .bench-table th,.bench-table td{border:1px solid #dbe2ea;padding:5px 7px;vertical-align:top;white-space:nowrap}
+    .bench-table th{background:#f1f5f9;text-align:left;position:sticky;top:0}
+    .bench-table td.val{white-space:normal;min-width:110px;max-width:260px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8rem}
+    .bench-table tr.section-head td{background:#eef2f7;font-weight:700}
+    .scroll{overflow-x:auto;max-height:70vh;overflow-y:auto}
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.82rem}
+    .muted{color:#6b7280}
+    .tiny-btn{padding:4px 9px;border:1px solid #c6d1df;border-radius:8px;background:#fff;cursor:pointer;font-size:.8rem}
+    .pill{display:inline-block;padding:1px 7px;border-radius:999px;font-size:.75rem;font-weight:700}
     @media (max-width: 980px){.panel-grid{grid-template-columns:1fr}.preview{position:static}.header-grid{grid-template-columns:repeat(2,1fr)}}
   </style>
 </head>
@@ -213,6 +295,124 @@ $ringingDateHasFullDate = preg_match('/^\d{2}\.\d{2}\.\d{4}$/', $ringingDateValu
     </aside>
   </div>
 </form>
+
+<div class="section" id="benchmark" style="margin-top:20px;">
+  <fieldset>
+    <legend>Benchmark this card</legend>
+    <p class="muted" style="margin:0 0 10px;">Re-decodes this card's image with the selected models and scores each result against the values saved above. The saved values are <strong>never changed</strong>; results are stored as benchmark data (visible on the Statistics page as well). Models offered here are the preferred models from Settings.</p>
+    <?php if (!$imageOnDisk): ?>
+      <p style="color:#a00;">The source image for this record is not on disk, so it cannot be benchmarked.</p>
+    <?php else: ?>
+    <form method="post" class="bench-form">
+      <input type="hidden" name="id" value="<?= $id ?>">
+      <input type="hidden" name="benchmark_run" value="1">
+      <div>
+        <div style="font-weight:700;font-size:.9rem;margin-bottom:4px;">Models</div>
+        <div class="bench-models">
+          <?php foreach ($benchmarkModels as $model): ?>
+            <label><input type="checkbox" name="benchmark_models[]" value="<?= h($model) ?>"> <?= h($model) ?></label>
+          <?php endforeach; ?>
+        </div>
+      </div>
+      <label style="display:flex;flex-direction:column;gap:4px;font-size:.9rem;font-weight:700;">Prompt
+        <select name="benchmark_prompt">
+          <?php foreach ($promptFiles as $promptFile): ?>
+            <option value="<?= h($promptFile) ?>" <?= $promptFile === $activePromptFile ? 'selected' : '' ?>><?= h(basename($promptFile)) ?><?= $promptFile === $activePromptFile ? ' (active)' : '' ?></option>
+          <?php endforeach; ?>
+        </select>
+      </label>
+      <p class="actions" style="margin:0;"><button type="submit">Run benchmark</button></p>
+    </form>
+    <?php endif; ?>
+
+    <?php if ($benchmarkPending > 0): ?>
+      <p id="bench-pending" style="margin-top:12px;padding:8px 12px;border-radius:10px;background:#eff6ff;color:#1d4ed8;font-weight:700;">
+        <?= $benchmarkPending ?> benchmark job(s) still running… this section refreshes automatically.
+      </p>
+    <?php endif; ?>
+
+    <?php if (!empty($benchmarkJobs)): ?>
+      <h3 style="margin:16px 0 8px;font-size:1rem;">Runs on this card</h3>
+      <div class="scroll" style="max-height:none;">
+      <table class="bench-table">
+        <thead><tr><th>Job</th><th>Model</th><th>Prompt</th><th>Status</th><th>Accuracy</th><th>Errors</th><th>Cost</th><th>Seconds</th><th>Reasoning tok.</th><th>When</th><th></th></tr></thead>
+        <tbody>
+        <?php foreach ($benchmarkJobs as $job): ?>
+          <tr>
+            <td class="mono">#<?= (int) $job['id'] ?></td>
+            <td class="mono"><?= h((string) $job['model']) ?></td>
+            <td class="mono" title="<?= h((string) $job['prompt_sha256']) ?>"><?= h(basename((string) ($job['prompt_name'] ?? ''))) ?> <span class="muted"><?= h(substr((string) $job['prompt_sha256'], 0, 8)) ?></span></td>
+            <td><span class="pill" style="<?= (string) $job['status'] === 'benchmarked' ? 'background:#dcfce7;color:#166534' : ((string) $job['status'] === 'failed' ? 'background:#fee2e2;color:#991b1b' : 'background:#dbeafe;color:#1e40af') ?>"><?= h((string) $job['status']) ?></span>
+              <?php if ((string) $job['status'] === 'failed'): ?><div class="muted" style="white-space:normal;max-width:320px;font-size:.75rem;"><?= h((string) $job['error_message']) ?></div><?php endif; ?></td>
+            <td style="text-align:right;font-weight:700;"><?= $job['accuracy'] === null ? '-' : number_format((float) $job['accuracy'], 1) . '%' ?></td>
+            <td style="text-align:right;"><?= $job['errors'] === null ? '-' : (int) $job['errors'] ?></td>
+            <td style="text-align:right;"><?= $job['cost_usd'] === null ? '-' : '$' . number_format((float) $job['cost_usd'], 4) ?></td>
+            <td style="text-align:right;"><?= $job['seconds'] === null ? '-' : (int) $job['seconds'] ?></td>
+            <td style="text-align:right;"><?= (int) ($job['reasoning_token_count'] ?? 0) ?></td>
+            <td class="muted"><?= h(substr((string) $job['created_at'], 0, 16)) ?></td>
+            <td><?php if ((string) $job['status'] === 'failed'): ?>
+              <form method="post" style="margin:0;"><input type="hidden" name="id" value="<?= $id ?>"><input type="hidden" name="benchmark_retry" value="<?= (int) $job['id'] ?>"><button class="tiny-btn" type="submit">Retry</button></form>
+            <?php endif; ?></td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+      </div>
+    <?php endif; ?>
+
+    <?php if (!empty($benchmarkMatrix['rows'])): ?>
+      <?php $matrixJobs = array_values(array_filter($benchmarkJobs, static fn($j) => in_array((int) $j['id'], $benchmarkScoredIds, true))); ?>
+      <h3 style="margin:16px 0 8px;font-size:1rem;">Field-by-field comparison against the saved values</h3>
+      <p class="muted" style="margin:0 0 8px;">Green = matches the saved value, yellow = same content in a different format, red = wrong or missing, grey = empty on both sides. Columns are ordered by accuracy.</p>
+      <div class="scroll">
+      <table class="bench-table">
+        <thead>
+          <tr>
+            <th>Field</th>
+            <th>Saved value</th>
+            <?php foreach ($matrixJobs as $job): ?>
+              <th title="job #<?= (int) $job['id'] ?> · <?= h(basename((string) ($job['prompt_name'] ?? ''))) ?>"><?= h((string) $job['model']) ?><br><span class="muted" style="font-weight:400;"><?= $job['accuracy'] === null ? '' : number_format((float) $job['accuracy'], 0) . '% · ' ?><?= h(substr((string) $job['prompt_sha256'], 0, 6)) ?></span></th>
+            <?php endforeach; ?>
+          </tr>
+        </thead>
+        <tbody>
+        <?php $lastGroup = ''; foreach ($benchmarkMatrix['rows'] as $row):
+          $group = $row['section'] === 'header' ? 'Header' : ucfirst($row['section']) . ' row ' . $row['row_no'] . ($row['extra'] ? ' (extra, not in saved record)' : '');
+          if ($group !== $lastGroup): $lastGroup = $group; ?>
+            <tr class="section-head"><td colspan="<?= 2 + count($matrixJobs) ?>"><?= h($group) ?></td></tr>
+          <?php endif; ?>
+          <tr>
+            <td class="mono"><?= h($row['field']) ?></td>
+            <td class="val" style="font-weight:700;"><?= $row['final'] === '' ? '<span class="muted">(empty)</span>' : h($row['final']) ?></td>
+            <?php foreach ($matrixJobs as $job): $cell = $row['cells'][(int) $job['id']] ?? null; ?>
+              <td class="val" style="<?= benchCellStyle($cell) ?>" title="<?= $cell ? h($cell['error_type']) : '' ?>"><?= $cell === null ? '' : ($cell['value'] === '' ? '<span class="muted">(empty)</span>' : h($cell['value'])) ?></td>
+            <?php endforeach; ?>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+      </div>
+    <?php endif; ?>
+  </fieldset>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  if (document.getElementById('bench-pending')) {
+    const poll = setInterval(function () {
+      fetch('edit.php?id=<?= $id ?>&action=benchmark_status', { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data && Number(data.pending) === 0) {
+            clearInterval(poll);
+            window.location.href = 'edit.php?id=<?= $id ?>#benchmark';
+          }
+        })
+        .catch(function () {});
+    }, 4000);
+  }
+});
+</script>
 
 <script>
 document.addEventListener('DOMContentLoaded', function() {

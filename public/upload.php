@@ -293,6 +293,17 @@ function usageMetadataFields(array $usageMetadata): array
     .section{margin-bottom:14px}
     .queue-wrap{display:grid;grid-template-columns:1fr;gap:14px}
     .queue-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .selected-files{margin-top:10px;border:1px solid #d7dce2;border-radius:12px;background:#f8fafc;padding:8px 12px}
+    .selected-files summary{cursor:pointer;font-weight:700;user-select:none}
+    .selected-files .muted-note{font-weight:400;color:#6b7280;font-size:.85rem}
+    .selected-files-grid{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}
+    .file-card{position:relative;width:118px;border:1px solid #cfd8e3;border-radius:10px;background:#fff;padding:6px;text-align:center}
+    .file-card img,.file-card .file-icon{display:block;width:104px;height:104px;object-fit:cover;border-radius:8px;background:#f1f5f9;cursor:zoom-in}
+    .file-card .file-icon{display:grid;place-items:center;color:#475569;font-weight:700;cursor:default}
+    .file-card .file-name{font-size:.72rem;color:#374151;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .file-card .file-remove{position:absolute;top:2px;right:2px;width:22px;height:22px;border-radius:50%;border:1px solid #fca5a5;background:#fff;color:#b91c1c;font-weight:700;cursor:pointer;line-height:1}
+    #lightbox{position:fixed;inset:0;display:none;z-index:10000;background:rgba(15,23,42,.85);align-items:center;justify-content:center;cursor:zoom-out}
+    #lightbox img{max-width:96vw;max-height:96vh;border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.5);background:#fff}
     .btn-main{padding:10px 16px;border:0;border-radius:999px;background:#184d8d;color:#fff;font-weight:700;cursor:pointer}
     .btn-main:hover{background:#123e72}
     .jobs-table{width:100%;border-collapse:collapse}
@@ -356,12 +367,18 @@ function usageMetadataFields(array $usageMetadata): array
     <fieldset>
       <legend>Queue Images For Background Decode</legend>
       <div class="queue-actions">
-        <input type="file" name="card_images[]" accept=".jpg,.jpeg,.png,.gif,.webp,.pdf,application/pdf" multiple required>
+        <input type="file" id="card-images-input" name="card_images[]" accept=".jpg,.jpeg,.png,.gif,.webp,.pdf,application/pdf" multiple required>
         <select name="prompt_file" aria-label="Prompt file">
           <?php foreach ($promptFiles as $promptFile): ?>
             <option value="<?= h($promptFile) ?>" <?= $promptFile === $selectedPromptFile ? 'selected' : '' ?>><?= h($promptFile) ?><?= $promptFile === $activePromptFile ? ' (active)' : '' ?></option>
           <?php endforeach; ?>
         </select>
+      </div>
+      <details id="selected-files" class="selected-files" open hidden>
+        <summary><span id="selected-files-summary">Selected files</span> <span class="muted-note">— click a thumbnail to enlarge, × to remove, Browse again to add more</span></summary>
+        <div id="selected-files-grid" class="selected-files-grid"></div>
+      </details>
+      <div class="queue-actions" style="margin-top:10px;">
         <button class="btn-main" type="submit">Start background decode</button>
       </div>
       <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
@@ -399,6 +416,7 @@ function usageMetadataFields(array $usageMetadata): array
 </div>
 
 <div id="hover-modal"><img src="" alt="Decode job image preview"></div>
+<div id="lightbox"><img src="" alt="Full size image"></div>
 
 <?php if ($comparisonDataJson !== 'null'): ?>
   <div id="review-focus-anchor" style="position:relative;top:-8px;"></div>
@@ -480,6 +498,120 @@ function usageMetadataFields(array $usageMetadata): array
         const secs = Math.floor((Date.now() - submitStart) / 1000);
         waitSeconds.textContent = String(secs);
       }, 250);
+    });
+  }
+
+  // Full-size image lightbox (used by the pre-upload thumbnails and the jobs table).
+  const lightbox = document.getElementById('lightbox');
+  const lightboxImg = lightbox ? lightbox.querySelector('img') : null;
+  window.openLightbox = function (url) {
+    if (!lightbox || !lightboxImg) return;
+    lightboxImg.src = url;
+    lightbox.style.display = 'flex';
+  };
+  if (lightbox) {
+    lightbox.addEventListener('click', function () {
+      lightbox.style.display = 'none';
+      if (lightboxImg) lightboxImg.src = '';
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && lightbox.style.display === 'flex') lightbox.click();
+    });
+  }
+
+  // Pre-upload file list: browsing again ADDS files, each thumbnail can be removed,
+  // and the input's FileList is rebuilt from the kept files before submit.
+  const fileInput = document.getElementById('card-images-input');
+  const filesBox = document.getElementById('selected-files');
+  const filesGrid = document.getElementById('selected-files-grid');
+  const filesSummary = document.getElementById('selected-files-summary');
+  if (fileInput && filesBox && filesGrid && filesSummary && typeof DataTransfer !== 'undefined') {
+    let kept = [];
+    const previews = new Map();
+
+    function fileKey(f) { return f.name + '|' + f.size + '|' + f.lastModified; }
+
+    function syncInput() {
+      const dt = new DataTransfer();
+      kept.forEach(function (f) { dt.items.add(f); });
+      fileInput.files = dt.files;
+      fileInput.required = kept.length === 0;
+    }
+
+    function previewUrl(f) {
+      const key = fileKey(f);
+      if (!previews.has(key)) previews.set(key, URL.createObjectURL(f));
+      return previews.get(key);
+    }
+
+    function render() {
+      filesGrid.innerHTML = '';
+      kept.forEach(function (f, idx) {
+        const card = document.createElement('div');
+        card.className = 'file-card';
+        const isImage = /^image\//.test(f.type);
+        if (isImage) {
+          const img = document.createElement('img');
+          img.src = previewUrl(f);
+          img.alt = f.name;
+          img.title = f.name + ' (' + Math.round(f.size / 1024) + ' kB)';
+          img.addEventListener('click', function () { window.openLightbox(img.src); });
+          img.addEventListener('mouseenter', function () {
+            if (!hoverModal || !hoverModalImg) return;
+            hoverModalImg.src = img.src;
+            hoverModal.style.display = 'block';
+          });
+          img.addEventListener('mousemove', function (e) {
+            if (!hoverModal) return;
+            hoverModal.style.left = (e.clientX + 18) + 'px';
+            hoverModal.style.top = (e.clientY + 18) + 'px';
+          });
+          img.addEventListener('mouseleave', function () {
+            if (!hoverModal || !hoverModalImg) return;
+            hoverModal.style.display = 'none';
+            hoverModalImg.src = '';
+          });
+          card.appendChild(img);
+        } else {
+          const icon = document.createElement('div');
+          icon.className = 'file-icon';
+          icon.textContent = (f.name.split('.').pop() || 'file').toUpperCase();
+          icon.title = f.name;
+          card.appendChild(icon);
+        }
+        const name = document.createElement('div');
+        name.className = 'file-name';
+        name.textContent = f.name;
+        name.title = f.name;
+        card.appendChild(name);
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'file-remove';
+        remove.title = 'Remove from upload';
+        remove.textContent = '×';
+        remove.addEventListener('click', function () {
+          kept.splice(idx, 1);
+          syncInput();
+          render();
+        });
+        card.appendChild(remove);
+        filesGrid.appendChild(card);
+      });
+      const total = kept.reduce(function (sum, f) { return sum + f.size; }, 0);
+      filesSummary.textContent = 'Selected files: ' + kept.length + ' (' + (total / (1024 * 1024)).toFixed(1) + ' MB)';
+      filesBox.hidden = kept.length === 0;
+    }
+
+    fileInput.addEventListener('change', function () {
+      const existing = new Set(kept.map(fileKey));
+      Array.from(fileInput.files || []).forEach(function (f) {
+        if (!existing.has(fileKey(f))) {
+          kept.push(f);
+          existing.add(fileKey(f));
+        }
+      });
+      syncInput();
+      render();
     });
   }
 
@@ -843,6 +975,12 @@ function usageMetadataFields(array $usageMetadata): array
     });
 
     body.querySelectorAll('.image-link-thumb').forEach(function (link) {
+      link.addEventListener('click', function (e) {
+        if (typeof window.openLightbox !== 'function') return;
+        e.preventDefault();
+        if (hoverModal) hoverModal.style.display = 'none';
+        window.openLightbox(link.dataset.imageUrl || link.getAttribute('href'));
+      });
       link.addEventListener('mouseenter', function () {
         if (!hoverModal || !hoverModalImg) return;
         hoverModalImg.src = link.dataset.imageUrl || link.getAttribute('href');

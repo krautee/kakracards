@@ -1999,6 +1999,138 @@ function refreshDecodeFieldQualityForHeader(int $headerId, array $finalDecoded):
     }
 }
 
+/**
+ * Benchmark jobs that were run for one saved record, newest first, with the per-job
+ * accuracy (normalized match on populated fields) and cost.
+ */
+function listBenchmarkJobsForHeader(int $headerId): array
+{
+    ensureDecodeJobAnalysisColumns();
+    $stmt = pdo()->prepare(
+        "SELECT j.id, j.status, j.requested_model, j.decoding_model, j.prompt_name, j.prompt_sha256,
+                j.cost_usd, j.reasoning_token_count, j.total_token_count, j.error_message, j.created_at,
+                TIMESTAMPDIFF(SECOND, j.started_at, j.finished_at) AS seconds,
+                q.populated, q.ok, q.errors
+         FROM decode_jobs j
+         LEFT JOIN (
+            SELECT decode_job_id,
+                   SUM(error_type <> 'both_empty') AS populated,
+                   SUM(error_type <> 'both_empty' AND normalized_match = 1) AS ok,
+                   SUM(error_type <> 'both_empty' AND normalized_match = 0) AS errors
+            FROM decode_field_quality WHERE header_id = :hq GROUP BY decode_job_id
+         ) q ON q.decode_job_id = j.id
+         WHERE j.benchmark_header_id = :h AND j.archived = 0
+         ORDER BY j.id DESC"
+    );
+    $stmt->execute(['h' => $headerId, 'hq' => $headerId]);
+    $jobs = [];
+    foreach ($stmt->fetchAll() ?: [] as $row) {
+        $populated = (int) ($row['populated'] ?? 0);
+        $row['accuracy'] = $populated > 0 ? 100 * (int) $row['ok'] / $populated : null;
+        $row['model'] = trim((string) ($row['decoding_model'] ?? '')) ?: (string) $row['requested_model'];
+        $jobs[] = $row;
+    }
+    return $jobs;
+}
+
+/**
+ * Field-by-field comparison of several benchmark jobs against the saved record.
+ * Returns ['rows' => [[section,row_no,field,final,cells{jobId => [value,error_type,match]}]...]]
+ * in display order: header fields, content rows, recovery rows; rows the models predicted
+ * but the record does not have appear at the end of their section as "extra".
+ */
+function benchmarkMatrixForHeader(int $headerId, array $jobIds): array
+{
+    $jobIds = array_values(array_filter(array_map('intval', $jobIds)));
+    if (!$jobIds) {
+        return ['rows' => []];
+    }
+    $placeholders = implode(',', array_fill(0, count($jobIds), '?'));
+    $stmt = pdo()->prepare(
+        "SELECT decode_job_id, section, row_no, field_name, predicted_value, final_value, normalized_match, error_type
+         FROM decode_field_quality
+         WHERE header_id = ? AND decode_job_id IN ($placeholders)
+         ORDER BY id"
+    );
+    $stmt->execute(array_merge([$headerId], $jobIds));
+
+    $sectionOrder = ['header' => 0, 'content' => 1, 'recovery' => 2];
+    $fieldOrder = [
+        'header' => array_flip(QUALITY_HEADER_KEYS),
+        'content' => array_flip(QUALITY_CONTENT_KEYS),
+        'recovery' => array_flip(QUALITY_RECOVERY_KEYS),
+    ];
+    $rows = [];
+    foreach ($stmt->fetchAll() ?: [] as $q) {
+        $section = (string) $q['section'];
+        $rowNo = $q['row_no'] === null ? 0 : (int) $q['row_no'];
+        $field = (string) $q['field_name'];
+        $key = $section . '|' . $rowNo . '|' . $field;
+        if (!isset($rows[$key])) {
+            $rows[$key] = [
+                'section' => $section,
+                'row_no' => $rowNo,
+                'field' => $field,
+                'final' => (string) $q['final_value'],
+                'extra' => (string) $q['error_type'] === 'extra_row',
+                'cells' => [],
+            ];
+        }
+        if ((string) $q['error_type'] !== 'extra_row' && $rows[$key]['final'] === '' && (string) $q['final_value'] !== '') {
+            $rows[$key]['final'] = (string) $q['final_value'];
+        }
+        $rows[$key]['cells'][(int) $q['decode_job_id']] = [
+            'value' => (string) $q['predicted_value'],
+            'error_type' => (string) $q['error_type'],
+            'match' => (int) $q['normalized_match'] === 1,
+        ];
+    }
+    uasort($rows, static function (array $a, array $b) use ($sectionOrder, $fieldOrder) {
+        return [$sectionOrder[$a['section']] ?? 9, $a['row_no'], $fieldOrder[$a['section']][$a['field']] ?? 99]
+            <=> [$sectionOrder[$b['section']] ?? 9, $b['row_no'], $fieldOrder[$b['section']][$b['field']] ?? 99];
+    });
+
+    return ['rows' => array_values($rows)];
+}
+
+/**
+ * Queue benchmark jobs for one saved record from the UI and start their workers.
+ * The saved record is never modified; results land in decode_field_quality (is_benchmark=1).
+ */
+function startBenchmarkForHeader(int $headerId, array $models, ?string $promptRelativePath): array
+{
+    $record = loadSavedRecordAsDecoded($headerId);
+    if ($record === null) {
+        throw new RuntimeException('Record not found');
+    }
+    $imagePath = (string) ($record['source_image_path'] ?? '');
+    if ($imagePath === '' || !is_file($imagePath)) {
+        throw new RuntimeException('Source image for this record is not on disk, cannot benchmark');
+    }
+    $allowed = allowedModels();
+    $models = array_values(array_unique(array_filter(array_map('trim', $models), static fn($m) => $m !== '' && in_array($m, $allowed, true))));
+    if (!$models) {
+        throw new RuntimeException('Select at least one model');
+    }
+    if ($promptRelativePath !== null && !isAllowedPromptRelativePath($promptRelativePath)) {
+        throw new RuntimeException('Unknown prompt file');
+    }
+
+    $group = 'bench-ui-' . $headerId . '-' . substr(md5((string) microtime(true)), 0, 8);
+    $jobIds = [];
+    foreach ($models as $model) {
+        $jobIds[] = createDecodeJob($imagePath, $promptRelativePath, $model, $group, $headerId);
+    }
+    foreach ($jobIds as $jobId) {
+        try {
+            startDecodeJobWorker($jobId);
+        } catch (Throwable $e) {
+            markDecodeJobFailed($jobId, $e->getMessage());
+        }
+    }
+    return $jobIds;
+}
+
 function deleteDecodeJob(int $jobId): void
 {
     $stmt = pdo()->prepare(
