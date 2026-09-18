@@ -168,12 +168,22 @@ function benchCellStyle(?array $cell): string
     .bench-models{display:flex;flex-wrap:wrap;gap:6px 14px}
     .bench-models label{font-size:.9rem;display:flex;align-items:center;gap:6px}
     .bench-form select{width:auto;min-width:260px}
-    .bench-table{border-collapse:collapse;width:100%;font-size:.85rem}
+    /* Fieldsets default to min-width:min-content, which lets a wide table stretch the
+       whole section instead of scrolling inside it. */
+    #benchmark fieldset{min-width:0}
+    .bench-table{border-collapse:collapse;width:auto;font-size:.85rem}
     .bench-table th,.bench-table td{border:1px solid #dbe2ea;padding:5px 7px;vertical-align:top;white-space:nowrap}
-    .bench-table th{background:#f1f5f9;text-align:left;position:sticky;top:0}
+    .bench-table th{background:#f1f5f9;text-align:left;position:sticky;top:0;z-index:1}
     .bench-table td.val{white-space:normal;min-width:110px;max-width:260px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8rem}
     .bench-table tr.section-head td{background:#eef2f7;font-weight:700}
-    .scroll{overflow-x:auto;max-height:70vh;overflow-y:auto}
+    .bench-table th:first-child,.bench-table td:first-child{position:sticky;left:0;background:#fff;z-index:2}
+    .bench-table th:first-child{background:#f1f5f9;z-index:3}
+    .scroll{overflow:auto;max-width:100%;max-height:70vh;border:1px solid #dbe2ea;border-radius:8px}
+    .scroll.runs{max-height:46vh;display:inline-block;max-width:100%}
+    th.sortable{cursor:pointer;user-select:none}
+    th.sortable::after{content:' \2195';color:#94a3b8;font-size:.75rem}
+    th.sorted-asc::after{content:' \2191';color:#1d4ed8}
+    th.sorted-desc::after{content:' \2193';color:#1d4ed8}
     .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.82rem}
     .muted{color:#6b7280}
     .tiny-btn{padding:4px 9px;border:1px solid #c6d1df;border-radius:8px;background:#fff;cursor:pointer;font-size:.8rem}
@@ -186,6 +196,7 @@ function benchCellStyle(?array $cell): string
   <a href="index.php">Home</a>
   <a href="upload.php">Upload &amp; Decode</a>
   <a href="settings.php">Settings (Prompt)</a>
+  <a href="prompts.php">Prompts</a>
   <a href="stats.php">Statistics</a>
 </p>
 <h1>Edit Record #<?= $id ?></h1>
@@ -333,7 +344,7 @@ function benchCellStyle(?array $cell): string
 
     <?php if (!empty($benchmarkJobs)): ?>
       <h3 style="margin:16px 0 8px;font-size:1rem;">Runs on this card</h3>
-      <div class="scroll" style="max-height:none;">
+      <div class="scroll runs">
       <table class="bench-table">
         <thead><tr><th>Job</th><th>Model</th><th>Prompt</th><th>Status</th><th>Accuracy</th><th>Errors</th><th>Cost</th><th>Seconds</th><th>Reasoning tok.</th><th>When</th><th></th></tr></thead>
         <tbody>
@@ -365,13 +376,13 @@ function benchCellStyle(?array $cell): string
       <h3 style="margin:16px 0 8px;font-size:1rem;">Field-by-field comparison against the saved values</h3>
       <p class="muted" style="margin:0 0 8px;">Green = matches the saved value, yellow = same content in a different format, red = wrong or missing, grey = empty on both sides. Columns are ordered by accuracy.</p>
       <div class="scroll">
-      <table class="bench-table">
+      <table class="bench-table no-sort">
         <thead>
           <tr>
             <th>Field</th>
             <th>Saved value</th>
             <?php foreach ($matrixJobs as $job): ?>
-              <th title="job #<?= (int) $job['id'] ?> · <?= h(basename((string) ($job['prompt_name'] ?? ''))) ?>"><?= h((string) $job['model']) ?><br><span class="muted" style="font-weight:400;"><?= $job['accuracy'] === null ? '' : number_format((float) $job['accuracy'], 0) . '% · ' ?><?= h(substr((string) $job['prompt_sha256'], 0, 6)) ?></span></th>
+              <th title="job #<?= (int) $job['id'] ?> · prompt <?= h((string) ($job['prompt_name'] ?? '')) ?> (<?= h((string) $job['prompt_sha256']) ?>)"><?= h((string) $job['model']) ?><br><span class="muted" style="font-weight:400;"><?= $job['accuracy'] === null ? '' : number_format((float) $job['accuracy'], 0) . '% · ' ?><?= h(preg_replace('/\.md$/', '', basename((string) ($job['prompt_name'] ?? '')))) ?> <?= h(substr((string) $job['prompt_sha256'], 0, 6)) ?></span></th>
             <?php endforeach; ?>
           </tr>
         </thead>
@@ -393,9 +404,38 @@ function benchCellStyle(?array $cell): string
       </table>
       </div>
     <?php endif; ?>
+
+    <?php
+      $promptsUsed = [];
+      foreach ($benchmarkJobs as $job) {
+          $sha = (string) ($job['prompt_sha256'] ?? '');
+          if ($sha !== '' && !isset($promptsUsed[$sha])) {
+              $promptsUsed[$sha] = getPromptVersion($sha);
+          }
+      }
+    ?>
+    <?php if (!empty($promptsUsed)): ?>
+      <h3 style="margin:16px 0 8px;font-size:1rem;">Prompt versions used on this card</h3>
+      <table class="bench-table no-sort" style="width:auto;">
+        <thead><tr><th>Prompt file</th><th>Version</th><th>First seen</th><th>Change note</th><th></th></tr></thead>
+        <tbody>
+        <?php foreach ($promptsUsed as $sha => $pv): ?>
+          <tr>
+            <td class="mono"><?= h(basename((string) ($pv['prompt_name'] ?? '(unknown)'))) ?></td>
+            <td class="mono" title="<?= h((string) $sha) ?>"><?= h(substr((string) $sha, 0, 10)) ?></td>
+            <td class="muted"><?= h(substr((string) ($pv['first_seen_at'] ?? ''), 0, 16)) ?></td>
+            <td style="white-space:normal;max-width:480px;"><?= $pv && trim((string) ($pv['notes'] ?? '')) !== '' ? h((string) $pv['notes']) : '<span class="muted">no note — add one on the Prompts page</span>' ?></td>
+            <td><a class="tiny-btn" href="prompts.php?view=<?= h((string) $sha) ?>#view">View prompt</a></td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+      <p class="muted" style="margin:6px 0 0;font-size:.85rem;">The same file name can have several versions: every edit of the file is a new version identified by its hash. Compare versions on the <a href="prompts.php">Prompts</a> page.</p>
+    <?php endif; ?>
   </fieldset>
 </div>
 
+<script src="sortable.js"></script>
 <script>
 document.addEventListener('DOMContentLoaded', function() {
   if (document.getElementById('bench-pending')) {

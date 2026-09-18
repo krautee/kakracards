@@ -25,6 +25,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             $selectedPromptFile = savePromptTextToFile($promptText, basename($selectedPromptFile), true);
         }
+        // Every distinct prompt text is a version; attach the change note to it.
+        $sha = registerPromptVersion($selectedPromptFile, $promptText);
+        $changeNote = trim((string) ($_POST['change_note'] ?? ''));
+        if ($changeNote !== '') {
+            setPromptVersionNotes($sha, $changeNote);
+        }
         savePreferredGeminiModels($selectedModels);
         $promptFiles = listPromptFiles();
         $activePromptFile = getCurrentPromptFileRelativePath();
@@ -43,7 +49,7 @@ $preferredModels = preferredGeminiModels();
 <html lang="en">
 <head><meta charset="utf-8"><title>Settings</title><style>body{font-family:Arial,sans-serif;max-width:1700px;margin:18px auto;padding:0 16px;background:#f6f4ef;color:#1f2933}.nav a{display:inline-block;padding:6px 10px;background:#1155cc;color:#fff;text-decoration:none;border-radius:4px;margin-right:8px}textarea{width:100%;min-height:420px}</style></head>
 <body>
-<p class="nav"><a href="index.php">Home</a><a href="upload.php">Upload &amp; Decode</a><a href="settings.php">Settings (Prompt)</a><a href="stats.php">Statistics</a></p>
+<p class="nav"><a href="index.php">Home</a><a href="upload.php">Upload &amp; Decode</a><a href="settings.php">Settings (Prompt)</a><a href="prompts.php">Prompts</a><a href="stats.php">Statistics</a></p>
 <h1>Prompt and Model Settings</h1>
 <?php if ($message !== ''): ?><p><strong><?= h($message) ?></strong></p><?php endif; ?>
 <?php if ($error !== ''): ?><p style="color:#a00;"><strong><?= h($error) ?></strong></p><?php endif; ?>
@@ -59,6 +65,10 @@ $preferredModels = preferredGeminiModels();
   <p>
     <label for="prompt_filename"><strong>Save as new file (optional)</strong></label><br>
     <input id="prompt_filename" name="prompt_filename" type="text" placeholder="my_prompt.md">
+  </p>
+  <p>
+    <label for="change_note"><strong>Change note (optional)</strong></label><br>
+    <input id="change_note" name="change_note" type="text" style="width:100%;max-width:700px" placeholder="What you changed and why — shown on the Prompts page for this version">
   </p>
   <details style="border:1px solid #c7ced6; border-radius:10px; margin-bottom:16px; background:#f8fafc;" id="preferred-models-details">
     <summary style="font-weight:bold; padding:12px; cursor:pointer; user-select:none;"><strong>Preferred models</strong> (Gemini + OpenRouter)</summary>

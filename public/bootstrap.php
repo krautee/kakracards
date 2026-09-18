@@ -752,7 +752,7 @@ function renderContentRowsTable(array $rows): string
     $headers = ['Position', 'Number', 'Status', 'Year', 'Nest', 'Notes'];
 
     $html = '<div style="overflow-x:auto;">';
-    $html .= '<table style="width:100%;border-collapse:collapse;margin-top:8px;" class="editable-table content-rows">';
+    $html .= '<table style="width:100%;border-collapse:collapse;margin-top:8px;" class="editable-table content-rows no-sort">';
     $html .= '<thead><tr style="background:#f6f9fc;">';
     foreach ($headers as $h) {
         $html .= '<th style="border:1px solid #d7dce2;padding:8px;text-align:left;font-weight:700;font-size:0.85rem;">' . h($h) . '</th>';
@@ -787,7 +787,7 @@ function renderRecoveryRowsTable(array $rows): string
     $headers = ['Number', 'Status', 'Date', 'Location', 'Person', 'Notes'];
 
     $html = '<div style="overflow-x:auto;">';
-    $html .= '<table style="width:100%;border-collapse:collapse;margin-top:8px;" class="editable-table recovery-rows">';
+    $html .= '<table style="width:100%;border-collapse:collapse;margin-top:8px;" class="editable-table recovery-rows no-sort">';
     $html .= '<thead><tr style="background:#f6f9fc;">';
     foreach ($headers as $h) {
         $html .= '<th style="border:1px solid #d7dce2;padding:8px;text-align:left;font-weight:700;font-size:0.85rem;">' . h($h) . '</th>';
@@ -1065,6 +1065,120 @@ function getPromptVersionText(string $sha256): ?string
     $row = $stmt->fetch();
 
     return $row ? (string) $row['prompt_text'] : null;
+}
+
+function getPromptVersion(string $sha256): ?array
+{
+    $stmt = pdo()->prepare('SELECT sha256, prompt_name, prompt_text, notes, first_seen_at FROM prompt_versions WHERE sha256 = :sha LIMIT 1');
+    $stmt->execute(['sha' => $sha256]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function setPromptVersionNotes(string $sha256, string $notes): void
+{
+    $stmt = pdo()->prepare('UPDATE prompt_versions SET notes = :notes WHERE sha256 = :sha');
+    $stmt->execute(['sha' => $sha256, 'notes' => trim($notes) === '' ? null : trim($notes)]);
+}
+
+/**
+ * Make sure every prompts/*.md file has a registered version, so a prompt is comparable
+ * and diffable before it has ever been run. Returns [relative path => sha256].
+ */
+function registerAllPromptFiles(): array
+{
+    ensureDecodeJobAnalysisColumns();
+    $map = [];
+    foreach (listPromptFiles() as $relative) {
+        $text = getPromptTextFromRelativePath($relative);
+        if ($text === '') {
+            continue;
+        }
+        $map[$relative] = registerPromptVersion($relative, $text);
+    }
+    return $map;
+}
+
+/**
+ * All prompt versions with usage and accuracy summary, newest first.
+ * Each row: sha256, prompt_name, notes, first_seen_at, is_current_file (text equals the
+ * file on disk right now), jobs, cards, models, best_model, best_acc, mean_acc.
+ */
+function listPromptVersionsWithStats(): array
+{
+    $current = registerAllPromptFiles();
+    $currentByHash = array_flip($current);
+    $versions = pdo()->query(
+        'SELECT p.sha256, p.prompt_name, p.notes, p.first_seen_at,
+                (SELECT COUNT(*) FROM decode_jobs j WHERE j.prompt_sha256 = p.sha256 AND j.status IN (\'saved\',\'succeeded\',\'benchmarked\')) AS jobs,
+                (SELECT COUNT(DISTINCT q.header_id) FROM decode_field_quality q WHERE q.prompt_sha256 = p.sha256) AS cards,
+                (SELECT COUNT(DISTINCT q.model) FROM decode_field_quality q WHERE q.prompt_sha256 = p.sha256) AS models
+         FROM prompt_versions p ORDER BY p.first_seen_at DESC, p.prompt_name'
+    )->fetchAll();
+    $acc = pdo()->query(
+        "SELECT prompt_sha256, model,
+                100 * SUM(error_type <> 'both_empty' AND normalized_match = 1) / NULLIF(SUM(error_type <> 'both_empty'), 0) AS acc
+         FROM decode_field_quality WHERE prompt_sha256 IS NOT NULL
+         GROUP BY prompt_sha256, model"
+    )->fetchAll();
+    $accByPrompt = [];
+    foreach ($acc as $a) {
+        if ($a['acc'] !== null) {
+            $accByPrompt[(string) $a['prompt_sha256']][(string) $a['model']] = (float) $a['acc'];
+        }
+    }
+    foreach ($versions as &$v) {
+        $sha = (string) $v['sha256'];
+        $v['is_current_file'] = isset($currentByHash[$sha]) ? $currentByHash[$sha] : null;
+        $models = $accByPrompt[$sha] ?? [];
+        arsort($models);
+        $v['best_model'] = $models ? (string) array_key_first($models) : null;
+        $v['best_acc'] = $models ? (float) reset($models) : null;
+        $v['mean_acc'] = $models ? array_sum($models) / count($models) : null;
+        $v['per_model'] = $models;
+    }
+    unset($v);
+    return $versions;
+}
+
+/**
+ * Line diff (LCS) between two texts. Returns [['type' => ' '|'-'|'+', 'text' => ...], ...].
+ */
+function lineDiff(string $old, string $new): array
+{
+    $a = preg_split('/\R/', $old) ?: [];
+    $b = preg_split('/\R/', $new) ?: [];
+    $n = count($a);
+    $m = count($b);
+    $lcs = array_fill(0, $n + 1, array_fill(0, $m + 1, 0));
+    for ($i = $n - 1; $i >= 0; $i--) {
+        for ($j = $m - 1; $j >= 0; $j--) {
+            $lcs[$i][$j] = $a[$i] === $b[$j] ? $lcs[$i + 1][$j + 1] + 1 : max($lcs[$i + 1][$j], $lcs[$i][$j + 1]);
+        }
+    }
+    $out = [];
+    $i = 0;
+    $j = 0;
+    while ($i < $n && $j < $m) {
+        if ($a[$i] === $b[$j]) {
+            $out[] = ['type' => ' ', 'text' => $a[$i]];
+            $i++;
+            $j++;
+        } elseif ($lcs[$i + 1][$j] >= $lcs[$i][$j + 1]) {
+            $out[] = ['type' => '-', 'text' => $a[$i]];
+            $i++;
+        } else {
+            $out[] = ['type' => '+', 'text' => $b[$j]];
+            $j++;
+        }
+    }
+    for (; $i < $n; $i++) {
+        $out[] = ['type' => '-', 'text' => $a[$i]];
+    }
+    for (; $j < $m; $j++) {
+        $out[] = ['type' => '+', 'text' => $b[$j]];
+    }
+    return $out;
 }
 
 function writePromptSnapshotFile(string $promptText): string
@@ -2194,6 +2308,14 @@ function ensureDecodeJobAnalysisColumns(): void
             if (!isset($columns[$column])) {
                 $pdo->exec("ALTER TABLE decode_jobs ADD COLUMN {$column} {$definition}");
             }
+        }
+        // 007_prompt_version_notes.sql
+        $promptColumns = [];
+        foreach ($pdo->query('SHOW COLUMNS FROM prompt_versions')->fetchAll() as $row) {
+            $promptColumns[(string) ($row['Field'] ?? '')] = true;
+        }
+        if (!isset($promptColumns['notes'])) {
+            $pdo->exec('ALTER TABLE prompt_versions ADD COLUMN notes TEXT NULL AFTER prompt_text');
         }
     } catch (Throwable) {
     }

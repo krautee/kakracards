@@ -19,7 +19,9 @@ pages.
 public/
   bootstrap.php        # ~1650 lines: env loading, PDO, model lists, job CRUD,
                         # PDF conversion, subprocess helpers, quality-tracking, HTML helpers
-  index.php            # list/open saved records
+  index.php            # list of saved records with per-card decode quality (top-5 model score)
+  prompts.php          # prompt versions: usage/accuracy per version, change notes, line diff, restore
+  sortable.js          # shared click-to-sort for any <table> with <thead> (class no-sort opts out)
   upload.php           # upload UI, model checkboxes, job queue table, review/compare UI
   edit.php             # record editor with image pan/zoom preview
   settings.php         # prompt file editor + preferred-model checkboxes
@@ -130,6 +132,9 @@ as `call_gemini` already does for backtick-fenced responses).
 - `public/rescore_quality.php --all` backfills cost/token splits for old jobs and rescores
   all quality rows with the current scoring code (keeps `manually_corrected`). Run it after
   changing anything in the scoring/normalization functions.
+- `edit.php` has a per-card "Benchmark this card" section (`startBenchmarkForHeader`,
+  `listBenchmarkJobsForHeader`, `benchmarkMatrixForHeader`) that runs models through the
+  PHP worker path and shows each model's output next to the saved value.
 - `public/stats.php` is the analysis UI: paired comparison (only cards all models share),
   benchmark/review/prompt filters, accuracy, unique-error accuracy, row recall/precision,
   omission vs hallucination, null-field accuracy, CER, OK/CHECK calibration, cost per
@@ -137,6 +142,12 @@ as `call_gemini` already does for backtick-fenced responses).
   which is the input for prompt tuning.
 
 ## Prompt tuning loop
+
+Prompt files in `prompts/` are the editable source; every distinct text becomes an
+immutable version in `prompt_versions` (sha256) the first time it is seen (job creation,
+Settings save, or `registerAllPromptFiles()` on prompts.php). `prompt_versions.notes` is a
+free-text changelog editable on prompts.php or via the Settings "change note" field.
+prompts.php diffs any two versions and can restore a superseded version as a new file.
 
 1. Look at the confusion report for a model/prompt on stats.php; repeated pairs across
    cards are conventions the prompt does not state (not handwriting problems).

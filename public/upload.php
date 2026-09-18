@@ -349,6 +349,7 @@ function usageMetadataFields(array $usageMetadata): array
   <a href="index.php">Home</a>
   <a href="upload.php">Upload &amp; Decode</a>
   <a href="settings.php">Settings (Prompt)</a>
+  <a href="prompts.php">Prompts</a>
   <a href="stats.php">Statistics</a>
 </p>
 <h1>Upload & Decode</h1>
@@ -460,6 +461,22 @@ function usageMetadataFields(array $usageMetadata): array
   const waitSeconds = document.getElementById('wait-seconds');
   const hoverModal = document.getElementById('hover-modal');
   const hoverModalImg = hoverModal ? hoverModal.querySelector('img') : null;
+
+  // Keep the hover preview inside the viewport (flip left/up when it would overflow).
+  function placeHoverModal(e) {
+    if (!hoverModal) return;
+    const w = hoverModal.offsetWidth;
+    const h = hoverModal.offsetHeight;
+    const pad = 12;
+    let left = e.clientX + 18;
+    let top = e.clientY + 18;
+    if (left + w + pad > window.innerWidth) left = e.clientX - w - 18;
+    if (top + h + pad > window.innerHeight) top = e.clientY - h - 18;
+    left = Math.max(pad, Math.min(left, window.innerWidth - w - pad));
+    top = Math.max(pad, Math.min(top, window.innerHeight - h - pad));
+    hoverModal.style.left = left + 'px';
+    hoverModal.style.top = top + 'px';
+  }
   const params = new URLSearchParams(window.location.search);
   let submitStart = 0;
   let submitTimer = null;
@@ -556,15 +573,15 @@ function usageMetadataFields(array $usageMetadata): array
           img.alt = f.name;
           img.title = f.name + ' (' + Math.round(f.size / 1024) + ' kB)';
           img.addEventListener('click', function () { window.openLightbox(img.src); });
-          img.addEventListener('mouseenter', function () {
+          img.addEventListener('mouseenter', function (e) {
             if (!hoverModal || !hoverModalImg) return;
             hoverModalImg.src = img.src;
             hoverModal.style.display = 'block';
+            placeHoverModal(e);
+            hoverModalImg.onload = function () { placeHoverModal(e); };
           });
           img.addEventListener('mousemove', function (e) {
-            if (!hoverModal) return;
-            hoverModal.style.left = (e.clientX + 18) + 'px';
-            hoverModal.style.top = (e.clientY + 18) + 'px';
+            placeHoverModal(e);
           });
           img.addEventListener('mouseleave', function () {
             if (!hoverModal || !hoverModalImg) return;
@@ -981,15 +998,15 @@ function usageMetadataFields(array $usageMetadata): array
         if (hoverModal) hoverModal.style.display = 'none';
         window.openLightbox(link.dataset.imageUrl || link.getAttribute('href'));
       });
-      link.addEventListener('mouseenter', function () {
+      link.addEventListener('mouseenter', function (e) {
         if (!hoverModal || !hoverModalImg) return;
         hoverModalImg.src = link.dataset.imageUrl || link.getAttribute('href');
         hoverModal.style.display = 'block';
+        placeHoverModal(e);
+        hoverModalImg.onload = function () { placeHoverModal(e); };
       });
       link.addEventListener('mousemove', function (e) {
-        if (!hoverModal) return;
-        hoverModal.style.left = (e.clientX + 18) + 'px';
-        hoverModal.style.top = (e.clientY + 18) + 'px';
+        placeHoverModal(e);
       });
       link.addEventListener('mouseleave', function () {
         if (!hoverModal || !hoverModalImg) return;

@@ -4,27 +4,65 @@ declare(strict_types=1);
 
 require __DIR__ . '/bootstrap.php';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string) ($_POST['action'] ?? '') === 'inline_update') {
-    header('Content-Type: application/json');
-    $id = (int) ($_POST['id'] ?? 0);
-    $field = (string) ($_POST['field'] ?? '');
-    $value = trim((string) ($_POST['value'] ?? ''));
-    $allowed = ['bird_id', 'card_code', 'scull_length'];
+$rows = pdo()->query(
+    'SELECT id, bird_id, card_code, scull_length, ring_number, ringing_date, source_image_filename, created_at
+     FROM cards_header ORDER BY id DESC LIMIT 500'
+)->fetchAll();
 
-    if ($id <= 0 || !in_array($field, $allowed, true)) {
-        http_response_code(400);
-        echo json_encode(['ok' => false, 'error' => 'Invalid request']);
-        exit;
+// Decoding quality per card: every model's best run (highest normalized field accuracy
+// across prompt versions), then the mean of the five best models. Using only the best
+// models keeps a card's score from being dragged down by how many weak models happened
+// to be tried on it; the "best" column shows the single best run.
+$quality = [];
+try {
+    $perModel = pdo()->query(
+        "SELECT header_id, model, MAX(acc) AS best_acc, COUNT(*) AS runs, COUNT(DISTINCT prompt_sha256) AS prompts
+         FROM (
+            SELECT header_id, model, decode_job_id, prompt_sha256,
+                   100 * SUM(error_type <> 'both_empty' AND normalized_match = 1) / NULLIF(SUM(error_type <> 'both_empty'), 0) AS acc
+            FROM decode_field_quality
+            GROUP BY header_id, model, decode_job_id, prompt_sha256
+         ) r
+         GROUP BY header_id, model"
+    )->fetchAll();
+    $byHeader = [];
+    foreach ($perModel as $r) {
+        $h = (int) $r['header_id'];
+        $byHeader[$h]['accs'][] = $r['best_acc'] === null ? null : (float) $r['best_acc'];
+        $byHeader[$h]['runs'] = ($byHeader[$h]['runs'] ?? 0) + (int) $r['runs'];
+        $byHeader[$h]['models'] = ($byHeader[$h]['models'] ?? 0) + 1;
     }
-
-    $sql = 'UPDATE cards_header SET ' . $field . '=:value, updated_at=CURRENT_TIMESTAMP WHERE id=:id';
-    $stmt = pdo()->prepare($sql);
-    $stmt->execute(['id' => $id, 'value' => $value]);
-    echo json_encode(['ok' => true]);
-    exit;
+    $promptCounts = pdo()->query(
+        'SELECT header_id, COUNT(DISTINCT prompt_sha256) AS prompts FROM decode_field_quality WHERE prompt_sha256 IS NOT NULL GROUP BY header_id'
+    )->fetchAll();
+    foreach ($promptCounts as $r) {
+        $byHeader[(int) $r['header_id']]['prompts'] = (int) $r['prompts'];
+    }
+    foreach ($byHeader as $h => $data) {
+        $accs = array_values(array_filter($data['accs'] ?? [], static fn($v) => $v !== null));
+        rsort($accs);
+        $top = array_slice($accs, 0, 5);
+        $quality[$h] = [
+            'runs' => (int) ($data['runs'] ?? 0),
+            'models' => (int) ($data['models'] ?? 0),
+            'prompts' => (int) ($data['prompts'] ?? 0),
+            'top5' => $top ? array_sum($top) / count($top) : null,
+            'best' => $accs ? $accs[0] : null,
+        ];
+    }
+} catch (Throwable) {
+    $quality = [];
 }
 
-$rows = pdo()->query('SELECT id, bird_id, card_code, scull_length, ring_number, source_image_filename, created_at FROM cards_header ORDER BY id DESC LIMIT 200')->fetchAll();
+function scoreStyle(?float $pct): string
+{
+    if ($pct === null) {
+        return 'color:#94a3b8';
+    }
+    $t = max(0.0, min(1.0, ($pct - 50) / 50));
+    $hue = (int) round(120 * $t);
+    return "background:hsl({$hue}, 70%, 84%);font-weight:700";
+}
 ?>
 <!doctype html>
 <html lang="en">
@@ -34,17 +72,24 @@ $rows = pdo()->query('SELECT id, bird_id, card_code, scull_length, ring_number, 
   <style>
     body{font-family:Arial,sans-serif;max-width:1700px;margin:18px auto;padding:0 16px;background:#f6f4ef;color:#1f2933}
     table{border-collapse:collapse;width:100%}
-    th,td{border:1px solid #ddd;padding:8px;vertical-align:middle}
-    th{background:#f4f4f4}
+    th,td{border:1px solid #ddd;padding:6px 8px;vertical-align:middle;font-size:.92rem}
+    th{background:#f4f4f4;text-align:left;white-space:nowrap}
+    td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+    td.narrow,th.narrow{width:1%;white-space:nowrap}
     .nav a{display:inline-block;padding:6px 10px;background:#1155cc;color:#fff;text-decoration:none;border-radius:4px;margin-right:8px}
-    .sort-header{cursor:pointer;user-select:none}
-    .sort-header:hover{background:#e8eef8}
-    .inline-cell{width:100%;box-sizing:border-box;padding:5px 7px;border:1px solid #cfd7e3;border-radius:6px}
-    .inline-cell.saving{background:#fff3cd}
-    .inline-cell.saved{background:#d1fae5}
-    .image-link{color:#1d4f91;text-decoration:underline;cursor:pointer}
+    .image-link{display:inline-block;width:28px;height:24px;border:1px solid #cfd8e3;border-radius:6px;background:#fff;text-align:center;line-height:24px;cursor:pointer;text-decoration:none}
+    .image-link:hover{background:#eef2ff}
+    .image-link svg{width:16px;height:16px;vertical-align:middle;fill:none;stroke:#1d4f91;stroke-width:1.8}
     #hover-modal{position:fixed;display:none;z-index:9999;pointer-events:none;background:#fff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 14px 40px rgba(0,0,0,.2);padding:8px}
     #hover-modal img{display:block;max-width:760px;max-height:760px;border-radius:6px}
+    #hover-modal .caption{font-size:.8rem;color:#374151;margin-top:6px;text-align:center}
+    .muted{color:#6b7280}
+    .legend{color:#6b7280;font-size:.85rem;margin:6px 0 12px}
+    th.sortable{cursor:pointer;user-select:none}
+    th.sortable:hover{background:#e8eef8}
+    th.sortable::after{content:' \2195';color:#94a3b8;font-size:.75rem}
+    th.sorted-asc::after{content:' \2191';color:#1d4ed8}
+    th.sorted-desc::after{content:' \2193';color:#1d4ed8}
   </style>
 </head>
 <body>
@@ -53,133 +98,91 @@ $rows = pdo()->query('SELECT id, bird_id, card_code, scull_length, ring_number, 
   <a href="index.php">Home</a>
   <a href="upload.php">Upload &amp; Decode</a>
   <a href="settings.php">Settings (Prompt)</a>
+  <a href="prompts.php">Prompts</a>
   <a href="stats.php">Statistics</a>
 </p>
+<p class="legend">Saved (reviewed) records. Hover the camera icon to preview the card, click a column header to sort. <strong>Top-5 score</strong> = mean accuracy of the five best models on that card (each model's best run across prompt versions); <strong>best</strong> = the single best run. Low scores across the board point at a hard card; a low score with many runs means the tested models were mostly weak ones.</p>
 <table id="cards-table">
   <thead>
     <tr>
-      <th>ID</th>
-      <th class="sort-header" data-key="bird_id" data-type="string">BirdID</th>
-      <th class="sort-header" data-key="card_code" data-type="string">Card Code</th>
-      <th class="sort-header" data-key="scull_length" data-type="number">Scull Length</th>
-      <th>Ring</th>
-      <th>Image</th>
-      <th>Created</th>
-      <th>Action</th>
+      <th class="narrow">ID</th>
+      <th class="narrow no-sort">Image</th>
+      <th class="narrow">BirdID</th>
+      <th class="narrow">Card code</th>
+      <th class="narrow">Skull</th>
+      <th class="narrow">Ring</th>
+      <th class="narrow">Ringed</th>
+      <th class="narrow" title="Decode runs scored against this record (review + benchmark)">Runs</th>
+      <th class="narrow" title="Distinct models tried">Models</th>
+      <th class="narrow" title="Distinct prompt versions tried">Prompts</th>
+      <th class="narrow" title="Mean accuracy of the 5 best models on this card">Top-5 score</th>
+      <th class="narrow" title="Best single run on this card">Best</th>
+      <th class="narrow">Created</th>
+      <th class="narrow no-sort">Action</th>
     </tr>
   </thead>
   <tbody>
-  <?php foreach ($rows as $row): ?>
-    <tr data-bird_id="<?= h((string) $row['bird_id']) ?>" data-card_code="<?= h((string) $row['card_code']) ?>" data-scull_length="<?= h((string) $row['scull_length']) ?>">
-      <td><?= (int) $row['id'] ?></td>
-      <td><input class="inline-cell inline-edit" data-id="<?= (int) $row['id'] ?>" data-field="bird_id" value="<?= h((string) $row['bird_id']) ?>"></td>
-      <td><input class="inline-cell inline-edit" data-id="<?= (int) $row['id'] ?>" data-field="card_code" value="<?= h((string) $row['card_code']) ?>"></td>
-      <td><input class="inline-cell inline-edit" data-id="<?= (int) $row['id'] ?>" data-field="scull_length" value="<?= h((string) $row['scull_length']) ?>"></td>
-      <td><?= h($row['ring_number']) ?></td>
-      <td>
-        <a class="image-link" href="image.php?id=<?= (int) $row['id'] ?>" data-image-url="image.php?id=<?= (int) $row['id'] ?>">
-          <?= h($row['source_image_filename']) ?>
+  <?php foreach ($rows as $row): $q = $quality[(int) $row['id']] ?? null; ?>
+    <tr>
+      <td class="num"><?= (int) $row['id'] ?></td>
+      <td class="narrow">
+        <a class="image-link" href="image.php?id=<?= (int) $row['id'] ?>" data-image-url="image.php?id=<?= (int) $row['id'] ?>" data-caption="<?= h((string) $row['source_image_filename']) ?><?= $q && $q['top5'] !== null ? ' · top-5 ' . number_format($q['top5'], 0) . '% · best ' . number_format((float) $q['best'], 0) . '%' : '' ?>" title="<?= h((string) $row['source_image_filename']) ?>" target="_blank">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
         </a>
       </td>
-      <td><?= h($row['created_at']) ?></td>
-      <td><a href="edit.php?id=<?= (int) $row['id'] ?>">Open/Edit</a></td>
+      <td class="narrow"><?= h((string) $row['bird_id']) ?></td>
+      <td class="narrow"><?= h((string) $row['card_code']) ?></td>
+      <td class="num"><?= h((string) $row['scull_length']) ?></td>
+      <td class="narrow"><?= h((string) $row['ring_number']) ?></td>
+      <td class="narrow muted"><?= h((string) $row['ringing_date']) ?></td>
+      <td class="num"><?= $q ? $q['runs'] : '<span class="muted">-</span>' ?></td>
+      <td class="num"><?= $q ? $q['models'] : '<span class="muted">-</span>' ?></td>
+      <td class="num"><?= $q ? $q['prompts'] : '<span class="muted">-</span>' ?></td>
+      <td class="num" style="<?= scoreStyle($q['top5'] ?? null) ?>"><?= $q && $q['top5'] !== null ? number_format($q['top5'], 1) . '%' : '-' ?></td>
+      <td class="num" style="<?= scoreStyle($q['best'] ?? null) ?>"><?= $q && $q['best'] !== null ? number_format($q['best'], 1) . '%' : '-' ?></td>
+      <td class="narrow muted"><?= h(substr((string) $row['created_at'], 0, 16)) ?></td>
+      <td class="narrow"><a href="edit.php?id=<?= (int) $row['id'] ?>">Open/Edit</a> · <a href="edit.php?id=<?= (int) $row['id'] ?>#benchmark">Benchmark</a></td>
     </tr>
   <?php endforeach; ?>
   </tbody>
 </table>
 
-<div id="hover-modal"><img src="" alt="Card image preview"></div>
+<div id="hover-modal"><img src="" alt="Card image preview"><div class="caption"></div></div>
 
+<script src="sortable.js"></script>
 <script>
 document.addEventListener('DOMContentLoaded', function () {
-  const table = document.getElementById('cards-table');
-  if (!table) return;
-
-  const tbody = table.querySelector('tbody');
   const modal = document.getElementById('hover-modal');
   const modalImg = modal ? modal.querySelector('img') : null;
-  const sortState = {};
+  const caption = modal ? modal.querySelector('.caption') : null;
 
-  function sortTable(key, type) {
-    const rows = Array.from(tbody.querySelectorAll('tr'));
-    const nextDir = sortState[key] === 'asc' ? 'desc' : 'asc';
-    sortState[key] = nextDir;
-
-    rows.sort(function (a, b) {
-      let av = (a.dataset[key] || '').trim();
-      let bv = (b.dataset[key] || '').trim();
-      if (type === 'number') {
-        av = Number(av || 0);
-        bv = Number(bv || 0);
-      } else {
-        av = av.toLowerCase();
-        bv = bv.toLowerCase();
-      }
-      if (av < bv) return nextDir === 'asc' ? -1 : 1;
-      if (av > bv) return nextDir === 'asc' ? 1 : -1;
-      return 0;
-    });
-
-    rows.forEach(function (row) {
-      tbody.appendChild(row);
-    });
+  // Keep the preview inside the viewport: prefer below-right of the cursor, flip to the
+  // left / above when it would not fit, and clamp as a last resort.
+  function placeModal(e) {
+    if (!modal) return;
+    const w = modal.offsetWidth;
+    const h = modal.offsetHeight;
+    const pad = 12;
+    let left = e.clientX + 18;
+    let top = e.clientY + 18;
+    if (left + w + pad > window.innerWidth) left = e.clientX - w - 18;
+    if (top + h + pad > window.innerHeight) top = e.clientY - h - 18;
+    left = Math.max(pad, Math.min(left, window.innerWidth - w - pad));
+    top = Math.max(pad, Math.min(top, window.innerHeight - h - pad));
+    modal.style.left = left + 'px';
+    modal.style.top = top + 'px';
   }
 
-  table.querySelectorAll('.sort-header').forEach(function (th) {
-    th.addEventListener('click', function () {
-      sortTable(th.dataset.key, th.dataset.type || 'string');
-    });
-  });
-
-  table.querySelectorAll('.inline-edit').forEach(function (input) {
-    input.addEventListener('change', function () {
-      const id = input.dataset.id;
-      const field = input.dataset.field;
-      const value = input.value;
-      const row = input.closest('tr');
-      if (!id || !field || !row) return;
-
-      input.classList.add('saving');
-      const body = new URLSearchParams();
-      body.set('action', 'inline_update');
-      body.set('id', id);
-      body.set('field', field);
-      body.set('value', value);
-
-      fetch('index.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString()
-      })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        input.classList.remove('saving');
-        if (!data || !data.ok) {
-          alert('Failed to save inline edit');
-          return;
-        }
-        row.dataset[field] = value;
-        input.classList.add('saved');
-        setTimeout(function () { input.classList.remove('saved'); }, 700);
-      })
-      .catch(function () {
-        input.classList.remove('saving');
-        alert('Failed to save inline edit');
-      });
-    });
-  });
-
-  table.querySelectorAll('.image-link').forEach(function (link) {
-    link.addEventListener('mouseenter', function () {
+  document.querySelectorAll('.image-link').forEach(function (link) {
+    link.addEventListener('mouseenter', function (e) {
       if (!modal || !modalImg) return;
       modalImg.src = link.dataset.imageUrl || link.getAttribute('href');
+      if (caption) caption.textContent = link.dataset.caption || '';
       modal.style.display = 'block';
+      placeModal(e);
+      modalImg.onload = function () { placeModal(e); };
     });
-    link.addEventListener('mousemove', function (e) {
-      if (!modal) return;
-      modal.style.left = (e.clientX + 18) + 'px';
-      modal.style.top = (e.clientY + 18) + 'px';
-    });
+    link.addEventListener('mousemove', placeModal);
     link.addEventListener('mouseleave', function () {
       if (!modal || !modalImg) return;
       modal.style.display = 'none';
